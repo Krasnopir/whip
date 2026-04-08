@@ -86,11 +86,11 @@ async def local_approve(request: Request):
     for rid, pending in reversed(list(state.pending.items())):
         if pending["type"] == "approve":
             if decision == "approve":
-                pending["response"] = {"decision": "approve"}
-                label = "✅ Одобрено локально"
+                pending["response"] = {"decision": "approve", "source": "terminal"}
+                label = "✅ Одобрено с ноута"
             else:
-                pending["response"] = {"decision": "block", "reason": message or "Отклонено локально"}
-                label = "❌ Отклонено локально"
+                pending["response"] = {"decision": "block", "reason": message or "Отклонено локально", "source": "terminal"}
+                label = "❌ Отклонено с ноута"
 
             # Edit TG message to show it was resolved locally
             msg_id = pending.get("message_id")
@@ -104,7 +104,7 @@ async def local_approve(request: Request):
     # Also handle stop requests (continue from local)
     for rid, pending in reversed(list(state.pending.items())):
         if pending["type"] == "stop":
-            pending["response"] = {"action": "continue", "message": message or "продолжай"}
+            pending["response"] = {"action": "continue", "message": message or "продолжай", "source": "terminal"}
             pending["event"].set()
             return JSONResponse({"ok": True, "rid": rid, "action": "continue"})
 

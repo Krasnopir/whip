@@ -1,29 +1,21 @@
 #!/usr/bin/env python3
 """
 Claude Code Stop hook.
-Sends summary to BOTH Telegram AND shows prompt in terminal.
-First channel to respond wins — Enter at laptop or button tap on phone.
+Sends summary to Telegram AND prints info in terminal.
+Continue from phone (button/text) or from another terminal tab (whip go "message").
+First channel wins.
 """
 import json
 import os
-import queue
 import sys
-import threading
 
 
 def read_summary(transcript_path: str, max_chars: int = 3000) -> str:
-    """
-    Collect the last few assistant text blocks from the transcript.
-    Concatenate them (newest last) until we hit max_chars.
-    This gives a meaningful picture of recent agent activity, not just the
-    last one-liner.
-    """
     try:
         lines = open(transcript_path).readlines()
     except Exception:
         return ""
 
-    # Collect all assistant text chunks in order
     chunks: list[str] = []
     for line in lines:
         line = line.strip()
@@ -37,7 +29,6 @@ def read_summary(transcript_path: str, max_chars: int = 3000) -> str:
             if msg.get("role") != "assistant":
                 continue
             content = msg.get("content", [])
-
             texts: list[str] = []
             if isinstance(content, str) and content.strip():
                 texts = [content.strip()]
@@ -57,17 +48,15 @@ def read_summary(transcript_path: str, max_chars: int = 3000) -> str:
     if not chunks:
         return ""
 
-    # Work backwards: take as many recent chunks as fit in max_chars
     selected: list[str] = []
     used = 0
     for chunk in reversed(chunks):
         if used + len(chunk) > max_chars:
-            # Take a partial slice of the oldest chunk if we have nothing yet
             if not selected:
                 selected.append(chunk[-(max_chars - used):])
             break
         selected.append(chunk)
-        used += len(chunk) + 1  # +1 for separator
+        used += len(chunk) + 1
         if used >= max_chars:
             break
 
@@ -88,74 +77,34 @@ def main():
     port = os.getenv("WHIP_DAEMON_PORT", "7331")
     host = os.getenv("WHIP_DAEMON_HOST", "127.0.0.1")
 
-    result_q: queue.Queue = queue.Queue(maxsize=1)
-
-    # --- Thread 1: send to daemon → Telegram ---
-    def wait_daemon():
-        try:
-            import httpx
-            resp = httpx.post(
-                f"http://{host}:{port}/stop",
-                json={"summary": summary, "cwd": cwd},
-                timeout=1800,
-            )
-            data = resp.json()
-            # Echo what came from TG so terminal user sees it
-            action = data.get("action", "done")
-            msg = data.get("message", "").strip()
-            if action == "continue" and msg:
-                sys.stderr.write(f"\n[whip] 📱 из TG: {msg}\n[whip] > ")
-                sys.stderr.flush()
-            result_q.put(data)
-        except Exception:
-            result_q.put({"action": "done", "message": ""})
-
-    # --- Thread 2: show prompt in terminal immediately (same time as TG) ---
-    def wait_terminal():
-        try:
-            import httpx
-            tty = open("/dev/tty", "r")
-            sys.stderr.write(
-                "\n[whip] ✅ Агент закончил. Что дальше?\n"
-                "[whip]    Enter = ебаш дальше    текст+Enter = команда    s = стоп\n"
-                "[whip]    (одновременно ждёт ответа из Telegram)\n"
-                "[whip] > "
-            )
-            sys.stderr.flush()
-            line = tty.readline().strip()
-            if result_q.empty():  # phone was faster — don't double-resolve
-                if line.lower() in ("s", "stop", "стоп", "q"):
-                    msg = ""
-                elif line == "":
-                    msg = "продолжай"
-                else:
-                    msg = line
-                httpx.post(
-                    f"http://{host}:{port}/local-approve",
-                    json={"decision": "approve", "message": msg},
-                    timeout=5,
-                )
-        except Exception:
-            pass
-
-    t_daemon = threading.Thread(target=wait_daemon, daemon=True)
-    t_terminal = threading.Thread(target=wait_terminal, daemon=True)
-    t_daemon.start()
-    t_terminal.start()
+    # Print to terminal
+    sys.stderr.write(
+        "\n[whip] ✅ Агент закончил\n"
+        "[whip]    → другой таб: whip go  /  whip go 'команда'  /  whip go s (стоп)\n"
+        "[whip]    → или ответь в Telegram\n"
+    )
+    sys.stderr.flush()
 
     try:
-        data = result_q.get(timeout=1800)
-    except queue.Empty:
-        data = {"action": "done", "message": ""}
+        import httpx
+        resp = httpx.post(
+            f"http://{host}:{port}/stop",
+            json={"summary": summary, "cwd": cwd},
+            timeout=1800,
+        )
+        data = resp.json()
+    except Exception:
+        sys.exit(0)
 
     action = data.get("action", "done")
     message = data.get("message", "").strip()
+    source = data.get("source", "tg")
 
     if action == "continue" and message:
-        sys.stderr.write(f"[whip] ▶ {message}\n")
+        sys.stderr.write(f"[whip] ▶ ({source}): {message}\n")
         print(message)
     else:
-        sys.stderr.write("[whip] ✅ Стоп\n")
+        sys.stderr.write(f"[whip] ✅ Стоп ({source})\n")
 
     sys.exit(0)
 

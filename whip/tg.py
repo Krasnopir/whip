@@ -188,7 +188,7 @@ class TelegramBridge:
 
         if kind == "stop":
             if action == "continue":
-                pending["response"] = {"action": "continue", "message": "продолжай"}
+                pending["response"] = {"action": "continue", "message": "продолжай", "source": "tg"}
             elif action == "custom":
                 pending["awaiting_text"] = True
                 if msg_id:
@@ -196,16 +196,16 @@ class TelegramBridge:
                 await self.send_plain("✏️ Напиши команду — отправлю агенту:")
                 return
             else:
-                pending["response"] = {"action": "done", "message": ""}
+                pending["response"] = {"action": "done", "message": "", "source": "tg"}
 
         elif kind == "approve":
             if action == "approve":
-                pending["response"] = {"decision": "approve"}
+                pending["response"] = {"decision": "approve", "source": "tg"}
             elif action == "approve_all":
                 self.state.approve_all = True
-                pending["response"] = {"decision": "approve"}
+                pending["response"] = {"decision": "approve", "source": "tg"}
             else:
-                pending["response"] = {"decision": "block", "reason": "Отклонено через Telegram"}
+                pending["response"] = {"decision": "block", "reason": "Отклонено через Telegram", "source": "tg"}
 
         if msg_id:
             await self._edit_after_tap(msg_id, original_text, chosen_label)
@@ -223,7 +223,7 @@ class TelegramBridge:
         for rid, pending in list(self.state.pending.items()):
             if pending.get("awaiting_text"):
                 pending["awaiting_text"] = False
-                pending["response"] = {"action": "continue", "message": text}
+                pending["response"] = {"action": "continue", "message": text, "source": "tg"}
                 pending["event"].set()
                 return
 
