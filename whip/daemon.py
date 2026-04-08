@@ -38,6 +38,7 @@ class DaemonState:
         self.approve_all: bool = False  # sticky "yes to all" flag
         self.last_cwd: str = ""         # for project name in approve messages
         self.tg: Optional[TelegramBridge] = None
+        self.ebash_echo: bool = False   # /ebash test: echo next TG message back
 
     def new_request(self, kind: str, timeout: int) -> tuple[str, asyncio.Event]:
         rid = uuid.uuid4().hex[:8]

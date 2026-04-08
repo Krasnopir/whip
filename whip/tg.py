@@ -229,6 +229,12 @@ class TelegramBridge:
             await self._handle_reset_shortcut(text)
             return
 
+        # /ebash echo test — if active, just echo back and done
+        if self.state.ebash_echo:
+            self.state.ebash_echo = False
+            await self.send_plain(f"✅ Получил: {text}")
+            return
+
         # Find a pending request that's waiting for text input
         log.info("TG msg: %r | pending: %s", text[:60],
                  [(r, p["type"], p.get("awaiting_text")) for r, p in self.state.pending.items()])
@@ -238,6 +244,7 @@ class TelegramBridge:
                 pending["awaiting_text"] = False
                 pending["response"] = {"action": "continue", "message": text, "source": "tg"}
                 pending["event"].set()
+                await self.send_plain(f"✅ Передал агенту: {text[:200]}")
                 return
 
         # Otherwise route to most recent stop request
@@ -246,9 +253,83 @@ class TelegramBridge:
                 log.info("Routing text to stop pending %s", rid)
                 pending["response"] = {"action": "continue", "message": text, "source": "tg"}
                 pending["event"].set()
+                await self.send_plain(f"✅ Передал агенту: {text[:200]}")
                 return
 
         log.info("TG msg: no pending to route to, ignoring")
+        await self.send_plain("⚪ Агент не ожидает команд сейчас.")
+
+    async def _fetch_rate_limits(self) -> str:
+        """
+        Call Anthropic count_tokens (cheap, no output generated) to read
+        the rate-limit response headers and format them for /limits.
+        Returns a string to embed in the TG message, or fallback to local stats.
+        """
+        import os as _os, json as _json, pathlib as _pl
+        from datetime import date, datetime, timezone
+
+        api_key = _os.environ.get("ANTHROPIC_API_KEY", "")
+        if api_key:
+            try:
+                async with httpx.AsyncClient() as client:
+                    r = await client.post(
+                        "https://api.anthropic.com/v1/messages/count_tokens",
+                        headers={
+                            "x-api-key": api_key,
+                            "anthropic-version": "2023-06-01",
+                            "content-type": "application/json",
+                        },
+                        json={
+                            "model": "claude-opus-4-6",
+                            "messages": [{"role": "user", "content": "hi"}],
+                        },
+                        timeout=10,
+                    )
+                h = r.headers
+                tok_limit = h.get("anthropic-ratelimit-tokens-limit", "")
+                tok_rem   = h.get("anthropic-ratelimit-tokens-remaining", "")
+                tok_reset = h.get("anthropic-ratelimit-tokens-reset", "")
+                req_limit = h.get("anthropic-ratelimit-requests-limit", "")
+                req_rem   = h.get("anthropic-ratelimit-requests-remaining", "")
+
+                lines = []
+                if tok_limit and tok_rem:
+                    used = int(tok_limit) - int(tok_rem)
+                    pct = int(used / int(tok_limit) * 100)
+                    lines.append(f"Токены: {used:,}/{int(tok_limit):,} ({pct}% использовано)")
+                if req_limit and req_rem:
+                    used_r = int(req_limit) - int(req_rem)
+                    lines.append(f"Запросы: {used_r}/{req_limit}")
+                if tok_reset:
+                    # ISO 8601 → local time
+                    try:
+                        dt = datetime.fromisoformat(tok_reset.replace("Z", "+00:00"))
+                        local = dt.astimezone().strftime("%H:%M")
+                        lines.append(f"Ресет лимитов: {local}")
+                    except Exception:
+                        lines.append(f"Ресет: {tok_reset}")
+                if lines:
+                    return "\n\n📡 *Лимиты (live):*\n" + "\n".join(lines)
+            except Exception as e:
+                log.debug("Rate limit fetch error: %s", e)
+
+        # Fallback: local stats-cache.json
+        stats_path = _pl.Path.home() / ".claude" / "stats-cache.json"
+        try:
+            stats = _json.loads(stats_path.read_text())
+            today_str = date.today().isoformat()
+            for entry in stats.get("dailyModelTokens", []):
+                if entry.get("date") == today_str:
+                    tokens = entry.get("tokensByModel", {})
+                    total_tok = sum(tokens.values())
+                    model_lines = "\n".join(
+                        f"  {m.split('-')[1] if '-' in m else m}: {v:,}"
+                        for m, v in tokens.items()
+                    )
+                    return f"\n\n📊 *Токены сегодня:* {total_tok:,}\n{model_lines}"
+        except Exception:
+            pass
+        return "\n\n_(нет данных — добавь ANTHROPIC_API_KEY в ~/.whip/.env для live-лимитов)_"
 
     async def _handle_reset_shortcut(self, text: str) -> None:
         """Handle 'reset 4h40m' plain-text shortcut from TG."""
@@ -266,15 +347,26 @@ class TelegramBridge:
             return
         fire_at = _t.time() + total
         msg_text = "🔄 Сессия Claude обновилась! Можно снова."
-        items = _d._load_schedules()
-        items.append({"fire_at": fire_at, "text": msg_text})
-        _d._save_schedules(items)
+        # Replace existing reset schedule (always single instance)
+        _d._save_schedules([{"fire_at": fire_at, "text": msg_text}])
         from datetime import datetime, timedelta
         dt = datetime.now() + timedelta(seconds=total)
         await self.send_plain(f"✅ Напомню в {dt.strftime('%H:%M')} (через {duration})")
 
     async def _handle_command(self, text: str, msg: dict) -> None:
         cmd = text.split()[0].lower().split("@")[0]  # strip @botname suffix
+
+        if cmd == "/ebash":
+            # Find pending stop and set awaiting_text, or enable echo test
+            for rid, pending in reversed(list(self.state.pending.items())):
+                if pending["type"] == "stop":
+                    pending["awaiting_text"] = True
+                    await self.send_plain("✏️ Напиши команду — отправлю агенту:")
+                    return
+            # No active agent — echo test mode
+            self.state.ebash_echo = True
+            await self.send_plain("✏️ Напиши что-нибудь — проверим что доходит:")
+            return
 
         if cmd == "/status" or cmd == "/start":
             pending_count = len(self.state.pending)
@@ -310,38 +402,9 @@ class TelegramBridge:
         elif cmd == "/limits":
             from . import daemon as _d
             items = _d._load_schedules()
-            import time as _t, pathlib, json
-            from datetime import date
+            import time as _t, os as _os
 
-            # Try to read today's token usage from Claude Code stats
-            stats_path = pathlib.Path.home() / ".claude" / "stats-cache.json"
-            stats_text = ""
-            try:
-                stats = json.loads(stats_path.read_text())
-                today_str = date.today().isoformat()
-                # dailyModelTokens for today
-                for entry in stats.get("dailyModelTokens", []):
-                    if entry.get("date") == today_str:
-                        tokens = entry.get("tokensByModel", {})
-                        total_tok = sum(tokens.values())
-                        model_lines = "\n".join(
-                            f"  {m.split('-')[1] if '-' in m else m}: {v:,}"
-                            for m, v in tokens.items()
-                        )
-                        stats_text = f"\n\n📊 *Токены сегодня:* {total_tok:,}\n{model_lines}"
-                        break
-                if not stats_text:
-                    # fallback: last entry
-                    activity = stats.get("dailyActivity", [])
-                    if activity:
-                        today = activity[-1]
-                        stats_text = (
-                            f"\n\n📊 *{today.get('date','?')}:*\n"
-                            f"Сообщений: {today.get('messageCount', '?')}\n"
-                            f"Tool calls: {today.get('toolCallCount', '?')}"
-                        )
-            except Exception:
-                pass
+            api_text = await self._fetch_rate_limits()
 
             reset_text = ""
             if items:
@@ -352,4 +415,4 @@ class TelegramBridge:
             else:
                 reset_text = "\n\n⏱ *Ресет:* не задан\n_Напиши `reset 4h40m` чтобы запомнить_"
 
-            await self.send_plain(f"📋 *Лимиты Claude Code*{stats_text}{reset_text}")
+            await self.send_plain(f"📋 *Лимиты Claude Code*{api_text}{reset_text}")
