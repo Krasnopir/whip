@@ -1,9 +1,11 @@
 """Whip daemon — FastAPI server that bridges Claude Code hooks and Telegram."""
 import asyncio
 import logging
+import pathlib
 import time
 import uuid
 from contextlib import asynccontextmanager
+from datetime import datetime
 from typing import Optional
 
 from fastapi import FastAPI, Request
@@ -14,6 +16,18 @@ from .tg import TelegramBridge
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("whip.daemon")
+
+_ACTIVITY_LOG = pathlib.Path.home() / ".whip" / "activity.log"
+
+
+def _activity(line: str) -> None:
+    """Append a human-readable event line to the activity log."""
+    ts = datetime.now().strftime("%H:%M:%S")
+    try:
+        with _ACTIVITY_LOG.open("a") as f:
+            f.write(f"[{ts}] {line}\n")
+    except Exception:
+        pass
 
 
 class DaemonState:
@@ -145,6 +159,10 @@ async def stop(request: Request):
         [{"text": "✅ Стоп, всё готово", "data": "done"}],
     ]
 
+    _activity(f"✅ [{project}] Агент закончил")
+    _activity(f"   {short_summary[:200].splitlines()[0] if short_summary else ''}")
+    _activity(f"   → whip go / whip go 'команда' / whip go s")
+
     msg_id = await state.tg.send(text, buttons, rid)
     state.pending[rid]["message_id"] = msg_id
     log.info("Stop hook [%s] waiting for Telegram...", rid)
@@ -153,12 +171,15 @@ async def stop(request: Request):
         await asyncio.wait_for(event.wait(), timeout=CONFIG["timeout"])
     except asyncio.TimeoutError:
         state.pop(rid)
-        log.info("Stop hook [%s] timed out", rid)
+        _activity(f"   ⏱ Таймаут ожидания — агент остановлен")
         return JSONResponse({"action": "done", "message": ""})
 
     resp = state.pop(rid)
     result = resp.get("response", {"action": "done", "message": ""})
-    log.info("Stop hook [%s] resolved: %s", rid, result.get("action"))
+    src = result.get("source", "?")
+    action = result.get("action", "done")
+    msg = result.get("message", "")
+    _activity(f"   ▶ [{src}] {msg if action == 'continue' else 'стоп'}")
     return JSONResponse(result)
 
 
@@ -183,6 +204,10 @@ async def approve(request: Request):
     project = _os.path.basename(state.last_cwd) if getattr(state, "last_cwd", "") else "?"
     tool_text = _format_tool(tool_name, tool_input)
     text = f"📁 *{project}*\n🔧 Разрешить?\n\n*{tool_name}*\n{tool_text}"
+
+    preview = tool_input.get("command", "")[:80] if tool_name == "Bash" else str(tool_input)[:80]
+    _activity(f"🔧 [{project}] {tool_name}: {preview}")
+    _activity(f"   → whip approve  /  whip deny")
     buttons = [
         [
             {"text": "✅ Да", "data": "approve"},
@@ -203,7 +228,10 @@ async def approve(request: Request):
 
     resp = state.pop(rid)
     result = resp.get("response", {"decision": "approve"})
-    log.info("Approve hook [%s] resolved: %s", rid, result.get("decision"))
+    src = result.get("source", "?")
+    decision = result.get("decision", "approve")
+    _activity(f"   {'✅' if decision == 'approve' else '❌'} [{src}] {decision}")
+    log.info("Approve hook [%s] resolved: %s", rid, decision)
     return JSONResponse(result)
 
 

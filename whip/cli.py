@@ -226,6 +226,86 @@ def go(message):
         click.echo(f"Daemon unreachable: {e}", err=True)
 
 
+# ------------------------------------------------------------------ tail
+
+@cli.command()
+def tail():
+    """
+    Watch all whip events in real time — run this in a separate terminal tab.
+
+    Shows approvals, stop events, and responses as they happen.
+    Use whip approve / whip deny / whip go right in the same tab.
+    """
+    activity_log = _config_dir() / "activity.log"
+    activity_log.parent.mkdir(parents=True, exist_ok=True)
+    activity_log.touch()
+
+    click.echo("── whip activity log ─────────────────────────────")
+    click.echo("   whip approve / deny / go  to respond from here")
+    click.echo("──────────────────────────────────────────────────")
+
+    import subprocess
+    try:
+        subprocess.run(["tail", "-f", str(activity_log)])
+    except KeyboardInterrupt:
+        pass
+
+
+# ------------------------------------------------------------------ reset-in
+
+@cli.command("reset-in")
+@click.argument("duration")
+@click.option("--message", "-m", default="", help="Custom notification text")
+def reset_in(duration, message):
+    """
+    Schedule a Telegram notification after a duration.
+
+    Examples:
+        whip reset-in 4h40m
+        whip reset-in 30m
+        whip reset-in 2h -m "Claude session reset — go!"
+    """
+    import re, threading
+
+    # Parse duration: "4h40m", "30m", "2h", "90s"
+    total = 0
+    for val, unit in re.findall(r"(\d+)([hms])", duration.lower()):
+        v = int(val)
+        if unit == "h":
+            total += v * 3600
+        elif unit == "m":
+            total += v * 60
+        elif unit == "s":
+            total += v
+
+    if total == 0:
+        click.echo(f"Couldn't parse duration: {duration!r}  (use e.g. 4h40m, 30m, 2h)")
+        return
+
+    from datetime import datetime, timedelta
+    fires_at = datetime.now() + timedelta(seconds=total)
+    text = message or f"🔄 Сессия обновилась! ({duration} прошло)"
+
+    def _fire():
+        import time, httpx
+        time.sleep(total)
+        try:
+            httpx.post(
+                f"{_daemon_url()}/notify",
+                json={"text": text},
+                timeout=10,
+            )
+        except Exception:
+            pass
+
+    t = threading.Thread(target=_fire, daemon=False)
+    t.start()
+
+    click.echo(f"⏱  Уведомление в {fires_at.strftime('%H:%M:%S')} (через {duration})")
+    click.echo(f"   \"{text}\"")
+    click.echo(f"   PID: {os.getpid()} — оставь этот процесс живым или используй: whip reset-in {duration} &")
+
+
 # ------------------------------------------------------------------ notify
 
 @cli.command()
