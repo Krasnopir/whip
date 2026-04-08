@@ -178,6 +178,54 @@ def status():
         click.echo("Daemon not running. Run: whip start")
 
 
+# ------------------------------------------------------------------ local approve/deny/go
+
+@cli.command()
+def approve():
+    """Approve the pending tool request from terminal (no phone needed)."""
+    try:
+        r = httpx.post(f"{_daemon_url()}/local-approve", json={"decision": "approve"}, timeout=5)
+        data = r.json()
+        if data.get("ok"):
+            click.echo(f"✅ Approved [{data.get('rid')}]")
+        else:
+            click.echo(f"Nothing pending to approve.")
+    except Exception as e:
+        click.echo(f"Daemon unreachable: {e}", err=True)
+
+
+@cli.command()
+@click.argument("reason", default="", required=False)
+def deny(reason):
+    """Deny the pending tool request from terminal."""
+    try:
+        r = httpx.post(f"{_daemon_url()}/local-approve",
+                       json={"decision": "block", "message": reason}, timeout=5)
+        data = r.json()
+        if data.get("ok"):
+            click.echo(f"❌ Denied [{data.get('rid')}]")
+        else:
+            click.echo("Nothing pending to deny.")
+    except Exception as e:
+        click.echo(f"Daemon unreachable: {e}", err=True)
+
+
+@cli.command()
+@click.argument("message", default="продолжай", required=False)
+def go(message):
+    """Unblock a waiting Stop hook from terminal — agent continues."""
+    try:
+        r = httpx.post(f"{_daemon_url()}/local-approve",
+                       json={"decision": "approve", "message": message}, timeout=5)
+        data = r.json()
+        if data.get("ok"):
+            click.echo(f"🚀 Sent [{data.get('rid')}]: {message}")
+        else:
+            click.echo("No pending stop request.")
+    except Exception as e:
+        click.echo(f"Daemon unreachable: {e}", err=True)
+
+
 # ------------------------------------------------------------------ notify
 
 @cli.command()

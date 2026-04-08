@@ -61,6 +61,15 @@ def main():
 
     try:
         import httpx
+
+        # Show in terminal so user can approve locally too
+        if tool_name == "Bash":
+            preview = tool_input.get("command", "")[:80]
+            print(f"[whip] 🔧 {tool_name}: {preview}", file=sys.stderr)
+        else:
+            print(f"[whip] 🔧 {tool_name}", file=sys.stderr)
+        print(f"[whip]    → approve: whip approve  |  deny: whip deny", file=sys.stderr)
+
         resp = httpx.post(
             f"http://{host}:{port}/approve",
             json={"tool_name": tool_name, "tool_input": tool_input},

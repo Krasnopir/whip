@@ -75,6 +75,42 @@ async def health():
     return {"status": "ok", "pending": len(state.pending), "approve_all": state.approve_all}
 
 
+@app.post("/local-approve")
+async def local_approve(request: Request):
+    """Approve or deny the most recent pending approve request from terminal."""
+    data = await request.json()
+    decision = data.get("decision", "approve")  # "approve" or "block"
+    message = data.get("message", "")
+
+    # Find most recent pending approve
+    for rid, pending in reversed(list(state.pending.items())):
+        if pending["type"] == "approve":
+            if decision == "approve":
+                pending["response"] = {"decision": "approve"}
+                label = "✅ Одобрено локально"
+            else:
+                pending["response"] = {"decision": "block", "reason": message or "Отклонено локально"}
+                label = "❌ Отклонено локально"
+
+            # Edit TG message to show it was resolved locally
+            msg_id = pending.get("message_id")
+            if msg_id and state.tg:
+                original = f"(решено с ноута)"
+                asyncio.create_task(state.tg._edit_after_tap(msg_id, original, label))
+
+            pending["event"].set()
+            return JSONResponse({"ok": True, "rid": rid, "decision": decision})
+
+    # Also handle stop requests (continue from local)
+    for rid, pending in reversed(list(state.pending.items())):
+        if pending["type"] == "stop":
+            pending["response"] = {"action": "continue", "message": message or "продолжай"}
+            pending["event"].set()
+            return JSONResponse({"ok": True, "rid": rid, "action": "continue"})
+
+    return JSONResponse({"ok": False, "error": "no pending requests"}, status_code=404)
+
+
 @app.post("/stop")
 async def stop(request: Request):
     """
