@@ -84,23 +84,19 @@ def main():
         except Exception:
             result_q.put({"decision": "approve"})
 
-    # --- Thread 2: show prompt in terminal after short delay, read keypress via /dev/tty ---
+    # --- Thread 2: show prompt in terminal immediately (same time as TG) ---
     def wait_terminal():
         try:
-            import time, httpx
-            # Give TG 1.5s to arrive on phone — so phone gets a chance to be first
-            time.sleep(1.5)
-            if not result_q.empty():
-                return  # already resolved via TG
+            import httpx
             tty = open("/dev/tty", "r")
             sys.stderr.write(
                 f"\n[whip] 🔧 {tool_name}: {preview}\n"
-                f"[whip]    Enter/y = разрешить    n = отклонить    (или с телефона)\n"
+                f"[whip]    Enter/y = разрешить    n = отклонить\n"
                 f"[whip] > "
             )
             sys.stderr.flush()
             line = tty.readline().strip().lower()
-            if result_q.empty():  # only act if not already resolved
+            if result_q.empty():  # phone was faster — don't double-resolve
                 decision = "block" if line in ("n", "no", "нет") else "approve"
                 httpx.post(
                     f"http://{host}:{port}/local-approve",

@@ -110,24 +110,20 @@ def main():
         except Exception:
             result_q.put({"action": "done", "message": ""})
 
-    # --- Thread 2: show prompt in terminal after delay, read from /dev/tty ---
+    # --- Thread 2: show prompt in terminal immediately (same time as TG) ---
     def wait_terminal():
         try:
-            import time, httpx
-            # Give TG 1.5s to arrive on phone first
-            time.sleep(1.5)
-            if not result_q.empty():
-                return  # already resolved via TG
+            import httpx
             tty = open("/dev/tty", "r")
             sys.stderr.write(
                 "\n[whip] ✅ Агент закончил. Что дальше?\n"
                 "[whip]    Enter = ебаш дальше    текст+Enter = команда    s = стоп\n"
-                "[whip]    (или ответь в Telegram)\n"
+                "[whip]    (одновременно ждёт ответа из Telegram)\n"
                 "[whip] > "
             )
             sys.stderr.flush()
             line = tty.readline().strip()
-            if result_q.empty():  # only act if not already resolved
+            if result_q.empty():  # phone was faster — don't double-resolve
                 if line.lower() in ("s", "stop", "стоп", "q"):
                     msg = ""
                 elif line == "":
