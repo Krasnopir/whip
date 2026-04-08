@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 """
 Claude Code PreToolUse hook.
-Intercepts potentially destructive tool calls and asks for approval via Telegram.
-Outputs JSON decision to stdout: {"decision": "approve"} or {"decision": "block", ...}
+Sends approval request to BOTH Telegram AND shows prompt in terminal.
+First channel to respond wins — no need to use the phone if you're at the laptop.
 """
 import json
 import os
+import queue
 import sys
+import threading
 
-# Tools that are always safe — never ask
+
 ALWAYS_ALLOW = {
     "Read", "Glob", "Grep", "LS",
     "TodoRead", "TodoWrite",
@@ -16,13 +18,11 @@ ALWAYS_ALLOW = {
     "NotebookRead",
 }
 
-# Bash patterns that warrant approval
 DANGEROUS_BASH = [
     "rm ", "rmdir", "unlink",
     "git push", "git reset --hard", "git clean",
     "drop table", "drop database", "truncate",
-    "curl", "wget",         # network ops
-    "> /",                  # overwrite system files
+    "> /",
     "sudo ",
     "chmod 777", "chmod -R",
     "kill ", "pkill",
@@ -31,8 +31,7 @@ DANGEROUS_BASH = [
 
 
 def is_dangerous_bash(cmd: str) -> bool:
-    low = cmd.lower()
-    return any(p in low for p in DANGEROUS_BASH)
+    return any(p in cmd.lower() for p in DANGEROUS_BASH)
 
 
 def should_ask(tool_name: str, tool_input: dict) -> bool:
@@ -40,7 +39,6 @@ def should_ask(tool_name: str, tool_input: dict) -> bool:
         return False
     if tool_name == "Bash":
         return is_dangerous_bash(tool_input.get("command", ""))
-    # Write/Edit — skip, too noisy. Only ask for Bash destructive ops.
     return False
 
 
@@ -59,37 +57,69 @@ def main():
     port = os.getenv("WHIP_DAEMON_PORT", "7331")
     host = os.getenv("WHIP_DAEMON_HOST", "127.0.0.1")
 
+    preview = ""
+    if tool_name == "Bash":
+        preview = tool_input.get("command", "")[:80]
+
+    result_q: queue.Queue = queue.Queue(maxsize=1)
+
+    # --- Thread 1: wait for daemon (TG button or whip approve CLI) ---
+    def wait_daemon():
+        try:
+            import httpx
+            resp = httpx.post(
+                f"http://{host}:{port}/approve",
+                json={"tool_name": tool_name, "tool_input": tool_input},
+                timeout=300,
+            )
+            result_q.put(resp.json())
+        except Exception:
+            result_q.put({"decision": "approve"})
+
+    # --- Thread 2: show prompt in terminal, read keypress via /dev/tty ---
+    def wait_terminal():
+        try:
+            import httpx
+            tty = open("/dev/tty", "r")
+            sys.stderr.write(
+                f"\n[whip] 🔧 {tool_name}: {preview}\n"
+                f"[whip]    y / Enter = разрешить    n = отклонить\n"
+                f"[whip] > "
+            )
+            sys.stderr.flush()
+            line = tty.readline().strip().lower()
+            decision = "block" if line in ("n", "no", "нет") else "approve"
+            # Resolve via local endpoint — this unblocks wait_daemon too
+            httpx.post(
+                f"http://{host}:{port}/local-approve",
+                json={"decision": decision},
+                timeout=5,
+            )
+            # wait_daemon will put result into queue when it gets the response
+        except Exception:
+            pass
+
+    t_daemon = threading.Thread(target=wait_daemon, daemon=True)
+    t_terminal = threading.Thread(target=wait_terminal, daemon=True)
+    t_daemon.start()
+    t_terminal.start()
+
     try:
-        import httpx
-
-        # Show in terminal so user can approve locally too
-        if tool_name == "Bash":
-            preview = tool_input.get("command", "")[:80]
-            print(f"[whip] 🔧 {tool_name}: {preview}", file=sys.stderr)
-        else:
-            print(f"[whip] 🔧 {tool_name}", file=sys.stderr)
-        print(f"[whip]    → approve: whip approve  |  deny: whip deny", file=sys.stderr)
-
-        resp = httpx.post(
-            f"http://{host}:{port}/approve",
-            json={"tool_name": tool_name, "tool_input": tool_input},
-            timeout=300,
-        )
-        data = resp.json()
-    except Exception:
-        # Daemon not running — approve by default
-        sys.exit(0)
+        data = result_q.get(timeout=300)
+    except queue.Empty:
+        data = {"decision": "approve"}
 
     decision = data.get("decision", "approve")
 
     if decision == "block":
-        print(f"[whip] ❌ Отклонено: {tool_name}", file=sys.stderr)
+        sys.stderr.write(f"[whip] ❌ Отклонено: {tool_name}\n")
         print(json.dumps({
             "decision": "block",
-            "reason": data.get("reason", "Отклонено через Telegram"),
+            "reason": data.get("reason", "Отклонено"),
         }))
     else:
-        print(f"[whip] ✅ Разрешено: {tool_name}", file=sys.stderr)
+        sys.stderr.write(f"[whip] ✅ Разрешено: {tool_name}\n")
+        print(json.dumps({"decision": "approve"}))
 
     sys.exit(0)
 
