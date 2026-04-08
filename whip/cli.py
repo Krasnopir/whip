@@ -258,14 +258,39 @@ def tail():
 @click.option("--message", "-m", default="", help="Custom notification text")
 def reset_in(duration, message):
     """
-    Schedule a Telegram notification after a duration.
+    Schedule a Telegram notification after a duration (persistent, survives restarts).
 
     Examples:
         whip reset-in 4h40m
-        whip reset-in 30m
-        whip reset-in 2h -m "Claude session reset — go!"
+        whip reset-in 30m -m "Go again!"
+        whip reset-in list    — show scheduled
+        whip reset-in clear   — cancel all
     """
-    import re, threading
+    import re, time as _time
+    from datetime import datetime, timedelta
+
+    if duration == "list":
+        try:
+            r = httpx.get(f"{_daemon_url()}/schedule", timeout=5)
+            items = r.json()
+            if not items:
+                click.echo("Нет запланированных уведомлений.")
+            for i in items:
+                secs = i["in_seconds"]
+                h, rem = divmod(secs, 3600)
+                m, s = divmod(rem, 60)
+                click.echo(f"  ⏱ через {h}h{m}m{s}s — \"{i['text']}\"")
+        except Exception as e:
+            click.echo(f"Daemon unreachable: {e}", err=True)
+        return
+
+    if duration == "clear":
+        try:
+            httpx.delete(f"{_daemon_url()}/schedule", timeout=5)
+            click.echo("Все расписания очищены.")
+        except Exception as e:
+            click.echo(f"Daemon unreachable: {e}", err=True)
+        return
 
     # Parse duration: "4h40m", "30m", "2h", "90s"
     total = 0
@@ -279,31 +304,27 @@ def reset_in(duration, message):
             total += v
 
     if total == 0:
-        click.echo(f"Couldn't parse duration: {duration!r}  (use e.g. 4h40m, 30m, 2h)")
+        click.echo(f"Не могу разобрать: {duration!r}  (формат: 4h40m / 30m / 2h)")
         return
 
-    from datetime import datetime, timedelta
-    fires_at = datetime.now() + timedelta(seconds=total)
-    text = message or f"🔄 Сессия обновилась! ({duration} прошло)"
+    fires_at = _time.time() + total
+    fires_at_dt = datetime.now() + timedelta(seconds=total)
+    text = message or f"🔄 Сессия Claude обновилась! Можно работать снова."
 
-    def _fire():
-        import time, httpx
-        time.sleep(total)
-        try:
-            httpx.post(
-                f"{_daemon_url()}/notify",
-                json={"text": text},
-                timeout=10,
-            )
-        except Exception:
-            pass
-
-    t = threading.Thread(target=_fire, daemon=False)
-    t.start()
-
-    click.echo(f"⏱  Уведомление в {fires_at.strftime('%H:%M:%S')} (через {duration})")
-    click.echo(f"   \"{text}\"")
-    click.echo(f"   PID: {os.getpid()} — оставь этот процесс живым или используй: whip reset-in {duration} &")
+    try:
+        r = httpx.post(
+            f"{_daemon_url()}/schedule",
+            json={"fire_at": fires_at, "text": text},
+            timeout=5,
+        )
+        if r.json().get("ok"):
+            click.echo(f"⏱  Уведомление в {fires_at_dt.strftime('%H:%M:%S')} (через {duration})")
+            click.echo(f"   \"{text}\"")
+            click.echo(f"   Персистентно — переживёт рестарт демона.")
+        else:
+            click.echo(f"Ошибка: {r.text}", err=True)
+    except Exception as e:
+        click.echo(f"Daemon unreachable: {e}", err=True)
 
 
 # ------------------------------------------------------------------ notify

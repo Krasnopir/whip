@@ -216,7 +216,12 @@ class TelegramBridge:
         chat_id = str(msg.get("chat", {}).get("id", ""))
         text = msg.get("text", "").strip()
 
-        if chat_id != self.chat_id or not text or text.startswith("/"):
+        if chat_id != self.chat_id or not text:
+            return
+
+        # Bot commands
+        if text.startswith("/"):
+            await self._handle_command(text, msg)
             return
 
         # Find a pending request that's waiting for text input
@@ -233,3 +238,88 @@ class TelegramBridge:
                 pending["response"] = {"action": "continue", "message": text}
                 pending["event"].set()
                 return
+
+    async def _handle_command(self, text: str, msg: dict) -> None:
+        cmd = text.split()[0].lower().split("@")[0]  # strip @botname suffix
+
+        if cmd == "/status" or cmd == "/start":
+            pending_count = len(self.state.pending)
+            approve_all = "🔥 да на всё" if self.state.approve_all else "выкл"
+            project = self.state.last_cwd.split("/")[-1] if self.state.last_cwd else "—"
+            await self.send_plain(
+                f"🎯 *Whip работает*\n\n"
+                f"Проект: `{project}`\n"
+                f"Ожидает: {pending_count}\n"
+                f"Approve all: {approve_all}"
+            )
+
+        elif cmd == "/reset":
+            # Show scheduled reset or ask to set one
+            from . import daemon as _d
+            items = _d._load_schedules()
+            import time as _t
+            if items:
+                lines = []
+                for i in items:
+                    secs = max(0, int(i["fire_at"] - _t.time()))
+                    h, rem = divmod(secs, 3600)
+                    m, s = divmod(rem, 60)
+                    lines.append(f"⏱ через {h}h{m}m — {i['text']}")
+                await self.send_plain("📅 *Запланировано:*\n\n" + "\n".join(lines))
+            else:
+                await self.send_plain(
+                    "⏱ *Нет запланированных уведомлений*\n\n"
+                    "Напиши время до ресета:\n"
+                    "`reset 4h40m` — и я запомню"
+                )
+
+        elif cmd == "/limits":
+            from . import daemon as _d
+            items = _d._load_schedules()
+            import time as _t, pathlib, json
+            # Try to read usage from Claude Code stats
+            stats_path = pathlib.Path.home() / ".claude" / "stats-cache.json"
+            stats_text = ""
+            try:
+                stats = json.loads(stats_path.read_text())
+                activity = stats.get("dailyActivity", [])
+                if activity:
+                    today = activity[-1]
+                    stats_text = (
+                        f"\n\n📊 *Сегодня:*\n"
+                        f"Сообщений: {today.get('messageCount', '?')}\n"
+                        f"Сессий: {today.get('sessionCount', '?')}\n"
+                        f"Tool calls: {today.get('toolCallCount', '?')}"
+                    )
+            except Exception:
+                pass
+
+            reset_text = ""
+            if items:
+                secs = max(0, int(items[0]["fire_at"] - _t.time()))
+                h, rem = divmod(secs, 3600)
+                m = rem // 60
+                reset_text = f"\n\n⏱ *Ресет через:* {h}h{m}m"
+
+            await self.send_plain(f"📋 *Лимиты Claude Code*{stats_text}{reset_text}")
+
+        elif text.lower().startswith("reset "):
+            # Quick shortcut: "reset 4h40m"
+            duration = text.split(None, 1)[1].strip()
+            import re, time as _t
+            from . import daemon as _d
+            total = 0
+            for val, unit in re.findall(r"(\d+)([hms])", duration.lower()):
+                v = int(val)
+                if unit == "h": total += v * 3600
+                elif unit == "m": total += v * 60
+                elif unit == "s": total += v
+            if total:
+                fire_at = _t.time() + total
+                msg_text = "🔄 Сессия Claude обновилась! Можно снова."
+                items = _d._load_schedules()
+                items.append({"fire_at": fire_at, "text": msg_text})
+                _d._save_schedules(items)
+                from datetime import datetime, timedelta
+                dt = datetime.now() + timedelta(seconds=total)
+                await self.send_plain(f"✅ Напомню в {dt.strftime('%H:%M')} (через {duration})")

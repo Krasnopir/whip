@@ -1,5 +1,6 @@
 """Whip daemon — FastAPI server that bridges Claude Code hooks and Telegram."""
 import asyncio
+import json
 import logging
 import pathlib
 import time
@@ -81,6 +82,43 @@ async def _cleanup_loop():
     while True:
         await asyncio.sleep(60)
         state.cleanup_expired()
+        await _check_schedules()
+
+
+_SCHEDULE_FILE = pathlib.Path.home() / ".whip" / "schedule.json"
+
+
+def _load_schedules() -> list[dict]:
+    try:
+        return json.loads(_SCHEDULE_FILE.read_text())
+    except Exception:
+        return []
+
+
+def _save_schedules(items: list[dict]) -> None:
+    try:
+        _SCHEDULE_FILE.write_text(json.dumps(items, ensure_ascii=False))
+    except Exception:
+        pass
+
+
+async def _check_schedules() -> None:
+    items = _load_schedules()
+    if not items:
+        return
+    now = time.time()
+    remaining = []
+    for item in items:
+        if item["fire_at"] <= now:
+            text = item.get("text", "⏱ Уведомление")
+            log.info("Schedule fired: %s", text)
+            _activity(f"⏱ Шедуллер: {text}")
+            if state.tg:
+                await state.tg.send_plain(text)
+        else:
+            remaining.append(item)
+    if len(remaining) != len(items):
+        _save_schedules(remaining)
 
 
 # -------------------------------------------------------------------------- routes
@@ -193,6 +231,11 @@ async def approve(request: Request):
     data = await request.json()
     tool_name: str = data.get("tool_name", "unknown")
     tool_input: dict = data.get("tool_input", {})
+    cwd: str = data.get("cwd", "")
+
+    # Update last_cwd so project name is always fresh
+    if cwd:
+        state.last_cwd = cwd
 
     # Approve immediately if approve_all is set
     if state.approve_all:
@@ -201,7 +244,7 @@ async def approve(request: Request):
     rid, event = state.new_request("approve", 300)  # 5 min for approvals
 
     import os as _os
-    project = _os.path.basename(state.last_cwd) if getattr(state, "last_cwd", "") else "?"
+    project = _os.path.basename(state.last_cwd) if state.last_cwd else "?"
     tool_text = _format_tool(tool_name, tool_input)
     text = f"📁 *{project}*\n🔧 Разрешить?\n\n*{tool_name}*\n{tool_text}"
 
@@ -233,6 +276,37 @@ async def approve(request: Request):
     _activity(f"   {'✅' if decision == 'approve' else '❌'} [{src}] {decision}")
     log.info("Approve hook [%s] resolved: %s", rid, decision)
     return JSONResponse(result)
+
+
+@app.post("/schedule")
+async def schedule(request: Request):
+    """Add a one-time scheduled notification."""
+    data = await request.json()
+    fire_at: float = data.get("fire_at", 0)
+    text: str = data.get("text", "⏱ Уведомление")
+    if not fire_at:
+        return JSONResponse({"ok": False, "error": "fire_at required"})
+    items = _load_schedules()
+    items.append({"fire_at": fire_at, "text": text})
+    _save_schedules(items)
+    log.info("Scheduled: '%s' at %s", text, fire_at)
+    return JSONResponse({"ok": True, "fire_at": fire_at})
+
+
+@app.get("/schedule")
+async def list_schedules():
+    items = _load_schedules()
+    now = time.time()
+    return JSONResponse([
+        {**i, "in_seconds": max(0, int(i["fire_at"] - now))}
+        for i in items
+    ])
+
+
+@app.delete("/schedule")
+async def clear_schedules():
+    _save_schedules([])
+    return JSONResponse({"ok": True})
 
 
 @app.post("/notify")

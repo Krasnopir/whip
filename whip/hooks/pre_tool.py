@@ -50,10 +50,13 @@ def main():
     tool_input = payload.get("tool_input", {})
 
     if not should_ask(tool_name, tool_input):
+        # Explicit approve suppresses Claude Code's own native approval prompt
+        print(json.dumps({"decision": "approve"}))
         sys.exit(0)
 
     port = os.getenv("WHIP_DAEMON_PORT", "7331")
     host = os.getenv("WHIP_DAEMON_HOST", "127.0.0.1")
+    cwd = payload.get("cwd", os.getcwd())
     preview = tool_input.get("command", "")[:80] if tool_name == "Bash" else ""
 
     # Print to terminal — user can approve from another tab
@@ -68,7 +71,7 @@ def main():
         import httpx
         resp = httpx.post(
             f"http://{host}:{port}/approve",
-            json={"tool_name": tool_name, "tool_input": tool_input},
+            json={"tool_name": tool_name, "tool_input": tool_input, "cwd": cwd},
             timeout=300,
         )
         data = resp.json()
