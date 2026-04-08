@@ -72,30 +72,41 @@ def main():
                 json={"tool_name": tool_name, "tool_input": tool_input},
                 timeout=300,
             )
-            result_q.put(resp.json())
+            data = resp.json()
+            decision = data.get("decision", "approve")
+            # Echo TG response to terminal
+            if decision == "approve":
+                sys.stderr.write(f"\n[whip] 📱 из TG: ✅ разрешено\n")
+            else:
+                sys.stderr.write(f"\n[whip] 📱 из TG: ❌ отклонено\n")
+            sys.stderr.flush()
+            result_q.put(data)
         except Exception:
             result_q.put({"decision": "approve"})
 
-    # --- Thread 2: show prompt in terminal, read keypress via /dev/tty ---
+    # --- Thread 2: show prompt in terminal after short delay, read keypress via /dev/tty ---
     def wait_terminal():
         try:
-            import httpx
+            import time, httpx
+            # Give TG 1.5s to arrive on phone — so phone gets a chance to be first
+            time.sleep(1.5)
+            if not result_q.empty():
+                return  # already resolved via TG
             tty = open("/dev/tty", "r")
             sys.stderr.write(
                 f"\n[whip] 🔧 {tool_name}: {preview}\n"
-                f"[whip]    y / Enter = разрешить    n = отклонить\n"
+                f"[whip]    Enter/y = разрешить    n = отклонить    (или с телефона)\n"
                 f"[whip] > "
             )
             sys.stderr.flush()
             line = tty.readline().strip().lower()
-            decision = "block" if line in ("n", "no", "нет") else "approve"
-            # Resolve via local endpoint — this unblocks wait_daemon too
-            httpx.post(
-                f"http://{host}:{port}/local-approve",
-                json={"decision": decision},
-                timeout=5,
-            )
-            # wait_daemon will put result into queue when it gets the response
+            if result_q.empty():  # only act if not already resolved
+                decision = "block" if line in ("n", "no", "нет") else "approve"
+                httpx.post(
+                    f"http://{host}:{port}/local-approve",
+                    json={"decision": decision},
+                    timeout=5,
+                )
         except Exception:
             pass
 
