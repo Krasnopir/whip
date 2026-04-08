@@ -72,6 +72,13 @@ def main():
 
     transcript_path = payload.get("transcript_path", "")
     cwd = payload.get("cwd", os.getcwd())
+
+    # Claude Code fires Stop hook before flushing the final message to the transcript.
+    # Wait briefly so the file is complete before we read it.
+    if transcript_path:
+        import time
+        time.sleep(1.5)
+
     summary = read_summary(transcript_path) if transcript_path else ""
 
     port = os.getenv("WHIP_DAEMON_PORT", "7331")
