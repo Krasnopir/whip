@@ -224,9 +224,17 @@ class TelegramBridge:
             await self._handle_command(text, msg)
             return
 
+        # "reset 4h40m" shortcut — schedule a rate-limit reminder
+        if text.lower().startswith("reset "):
+            await self._handle_reset_shortcut(text)
+            return
+
         # Find a pending request that's waiting for text input
+        log.info("TG msg: %r | pending: %s", text[:60],
+                 [(r, p["type"], p.get("awaiting_text")) for r, p in self.state.pending.items()])
         for rid, pending in list(self.state.pending.items()):
             if pending.get("awaiting_text"):
+                log.info("Routing text to awaiting_text pending %s", rid)
                 pending["awaiting_text"] = False
                 pending["response"] = {"action": "continue", "message": text, "source": "tg"}
                 pending["event"].set()
@@ -235,9 +243,35 @@ class TelegramBridge:
         # Otherwise route to most recent stop request
         for rid, pending in reversed(list(self.state.pending.items())):
             if pending["type"] == "stop":
-                pending["response"] = {"action": "continue", "message": text}
+                log.info("Routing text to stop pending %s", rid)
+                pending["response"] = {"action": "continue", "message": text, "source": "tg"}
                 pending["event"].set()
                 return
+
+        log.info("TG msg: no pending to route to, ignoring")
+
+    async def _handle_reset_shortcut(self, text: str) -> None:
+        """Handle 'reset 4h40m' plain-text shortcut from TG."""
+        duration = text.split(None, 1)[1].strip()
+        import re, time as _t
+        from . import daemon as _d
+        total = 0
+        for val, unit in re.findall(r"(\d+)([hms])", duration.lower()):
+            v = int(val)
+            if unit == "h": total += v * 3600
+            elif unit == "m": total += v * 60
+            elif unit == "s": total += v
+        if not total:
+            await self.send_plain(f"Не могу разобрать: {duration!r}  (формат: 4h40m / 30m / 2h)")
+            return
+        fire_at = _t.time() + total
+        msg_text = "🔄 Сессия Claude обновилась! Можно снова."
+        items = _d._load_schedules()
+        items.append({"fire_at": fire_at, "text": msg_text})
+        _d._save_schedules(items)
+        from datetime import datetime, timedelta
+        dt = datetime.now() + timedelta(seconds=total)
+        await self.send_plain(f"✅ Напомню в {dt.strftime('%H:%M')} (через {duration})")
 
     async def _handle_command(self, text: str, msg: dict) -> None:
         cmd = text.split()[0].lower().split("@")[0]  # strip @botname suffix
@@ -277,20 +311,35 @@ class TelegramBridge:
             from . import daemon as _d
             items = _d._load_schedules()
             import time as _t, pathlib, json
-            # Try to read usage from Claude Code stats
+            from datetime import date
+
+            # Try to read today's token usage from Claude Code stats
             stats_path = pathlib.Path.home() / ".claude" / "stats-cache.json"
             stats_text = ""
             try:
                 stats = json.loads(stats_path.read_text())
-                activity = stats.get("dailyActivity", [])
-                if activity:
-                    today = activity[-1]
-                    stats_text = (
-                        f"\n\n📊 *Сегодня:*\n"
-                        f"Сообщений: {today.get('messageCount', '?')}\n"
-                        f"Сессий: {today.get('sessionCount', '?')}\n"
-                        f"Tool calls: {today.get('toolCallCount', '?')}"
-                    )
+                today_str = date.today().isoformat()
+                # dailyModelTokens for today
+                for entry in stats.get("dailyModelTokens", []):
+                    if entry.get("date") == today_str:
+                        tokens = entry.get("tokensByModel", {})
+                        total_tok = sum(tokens.values())
+                        model_lines = "\n".join(
+                            f"  {m.split('-')[1] if '-' in m else m}: {v:,}"
+                            for m, v in tokens.items()
+                        )
+                        stats_text = f"\n\n📊 *Токены сегодня:* {total_tok:,}\n{model_lines}"
+                        break
+                if not stats_text:
+                    # fallback: last entry
+                    activity = stats.get("dailyActivity", [])
+                    if activity:
+                        today = activity[-1]
+                        stats_text = (
+                            f"\n\n📊 *{today.get('date','?')}:*\n"
+                            f"Сообщений: {today.get('messageCount', '?')}\n"
+                            f"Tool calls: {today.get('toolCallCount', '?')}"
+                        )
             except Exception:
                 pass
 
@@ -299,27 +348,8 @@ class TelegramBridge:
                 secs = max(0, int(items[0]["fire_at"] - _t.time()))
                 h, rem = divmod(secs, 3600)
                 m = rem // 60
-                reset_text = f"\n\n⏱ *Ресет через:* {h}h{m}m"
+                reset_text = f"\n\n⏱ *Ресет через:* {h}h{m}m\n_Напиши `reset 4h40m` чтобы обновить_"
+            else:
+                reset_text = "\n\n⏱ *Ресет:* не задан\n_Напиши `reset 4h40m` чтобы запомнить_"
 
             await self.send_plain(f"📋 *Лимиты Claude Code*{stats_text}{reset_text}")
-
-        elif text.lower().startswith("reset "):
-            # Quick shortcut: "reset 4h40m"
-            duration = text.split(None, 1)[1].strip()
-            import re, time as _t
-            from . import daemon as _d
-            total = 0
-            for val, unit in re.findall(r"(\d+)([hms])", duration.lower()):
-                v = int(val)
-                if unit == "h": total += v * 3600
-                elif unit == "m": total += v * 60
-                elif unit == "s": total += v
-            if total:
-                fire_at = _t.time() + total
-                msg_text = "🔄 Сессия Claude обновилась! Можно снова."
-                items = _d._load_schedules()
-                items.append({"fire_at": fire_at, "text": msg_text})
-                _d._save_schedules(items)
-                from datetime import datetime, timedelta
-                dt = datetime.now() + timedelta(seconds=total)
-                await self.send_plain(f"✅ Напомню в {dt.strftime('%H:%M')} (через {duration})")
