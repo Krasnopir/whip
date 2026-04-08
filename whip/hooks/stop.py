@@ -84,12 +84,14 @@ def main():
     port = os.getenv("WHIP_DAEMON_PORT", "7331")
     host = os.getenv("WHIP_DAEMON_HOST", "127.0.0.1")
 
-    # Print to terminal
-    sys.stderr.write(
-        "\n[whip] ✅ Агент закончил\n"
-        "[whip]    → другой таб: whip go  /  whip go 'команда'  /  whip go s (стоп)\n"
-        "[whip]    → или ответь в Telegram\n"
-    )
+    # Print summary to terminal too — not just TG
+    project = os.path.basename(cwd) if cwd else "?"
+    sys.stderr.write(f"\n{'─'*50}\n")
+    sys.stderr.write(f"[whip] ✅ [{project}] Агент закончил\n\n")
+    if summary:
+        sys.stderr.write(summary[:1000] + "\n")
+    sys.stderr.write(f"\n{'─'*50}\n")
+    sys.stderr.write("[whip]    → whip go  /  whip go 'команда'  /  whip go s  (или в Telegram)\n")
     sys.stderr.flush()
 
     try:

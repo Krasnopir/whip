@@ -21,6 +21,7 @@ class DaemonState:
         # request_id -> {event, response, type, expires_at, awaiting_text}
         self.pending: dict[str, dict] = {}
         self.approve_all: bool = False  # sticky "yes to all" flag
+        self.last_cwd: str = ""         # for project name in approve messages
         self.tg: Optional[TelegramBridge] = None
 
     def new_request(self, kind: str, timeout: int) -> tuple[str, asyncio.Event]:
@@ -125,15 +126,18 @@ async def stop(request: Request):
 
     rid, event = state.new_request("stop", CONFIG["timeout"])
 
-    # Reset approve_all when a new session starts
+    # Reset approve_all when a new session starts, remember cwd for approve messages
     state.approve_all = False
+    if cwd:
+        state.last_cwd = cwd
 
-    short_summary = summary[:2000]
-    cwd_line = f"\n\n`📁 {cwd}`" if cwd else ""
+    import os as _os
+    project = _os.path.basename(cwd) if cwd else "unknown"
+    short_summary = summary[:2000] if summary else "(нет текста)"
     text = (
-        f"✅ *Агент закончил*\n\n"
+        f"📁 *{project}*\n"
+        f"✅ Агент закончил\n\n"
         f"```\n{short_summary}\n```"
-        f"{cwd_line}"
     )
     buttons = [
         [{"text": "🚀 Ебаш дальше", "data": "continue"}],
@@ -175,8 +179,10 @@ async def approve(request: Request):
 
     rid, event = state.new_request("approve", 300)  # 5 min for approvals
 
+    import os as _os
+    project = _os.path.basename(state.last_cwd) if getattr(state, "last_cwd", "") else "?"
     tool_text = _format_tool(tool_name, tool_input)
-    text = f"🔧 *Разрешить?*\n\n*{tool_name}*\n{tool_text}"
+    text = f"📁 *{project}*\n🔧 Разрешить?\n\n*{tool_name}*\n{tool_text}"
     buttons = [
         [
             {"text": "✅ Да", "data": "approve"},
