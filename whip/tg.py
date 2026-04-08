@@ -19,6 +19,13 @@ class TelegramBridge:
 
     # ------------------------------------------------------------------ send
 
+    @staticmethod
+    def _escape(text: str) -> str:
+        """Escape special chars for Telegram MarkdownV2."""
+        for ch in r"\_*[]()~`>#+-=|{}.!":
+            text = text.replace(ch, f"\\{ch}")
+        return text
+
     async def send(self, text: str, buttons: list[list[dict]], request_id: str) -> None:
         keyboard = {
             "inline_keyboard": [
@@ -27,6 +34,7 @@ class TelegramBridge:
             ]
         }
         async with httpx.AsyncClient() as client:
+            # Try MarkdownV2 first, fall back to plain text if Telegram rejects
             r = await client.post(
                 f"{self.base}/sendMessage",
                 json={
@@ -38,7 +46,18 @@ class TelegramBridge:
                 timeout=30,
             )
             if not r.json().get("ok"):
-                log.warning("TG sendMessage failed: %s", r.text)
+                # Fallback: send as plain text, no formatting
+                r = await client.post(
+                    f"{self.base}/sendMessage",
+                    json={
+                        "chat_id": self.chat_id,
+                        "text": text,
+                        "reply_markup": keyboard,
+                    },
+                    timeout=30,
+                )
+                if not r.json().get("ok"):
+                    log.warning("TG sendMessage failed: %s", r.text)
 
     async def send_plain(self, text: str) -> None:
         async with httpx.AsyncClient() as client:

@@ -40,11 +40,8 @@ def should_ask(tool_name: str, tool_input: dict) -> bool:
         return False
     if tool_name == "Bash":
         return is_dangerous_bash(tool_input.get("command", ""))
-    # Write/Edit always ask (they change files)
-    if tool_name in ("Write", "Edit", "MultiEdit"):
-        return True
-    # Anything else we don't recognise — ask
-    return tool_name not in ("Agent",)
+    # Write/Edit — skip, too noisy. Only ask for Bash destructive ops.
+    return False
 
 
 def main():
