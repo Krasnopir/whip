@@ -10,7 +10,13 @@ import os
 import sys
 
 
-def read_summary(transcript_path: str, max_chars: int = 3000) -> str:
+def read_summary(transcript_path: str) -> str:
+    """
+    Return only the LAST assistant text from the transcript.
+    The Stop hook fires right after the agent writes its final response,
+    so the last entry is exactly what we want to show.
+    If the last message is very short (<80 chars), also prepend the previous one.
+    """
     try:
         lines = open(transcript_path).readlines()
     except Exception:
@@ -48,20 +54,14 @@ def read_summary(transcript_path: str, max_chars: int = 3000) -> str:
     if not chunks:
         return ""
 
-    selected: list[str] = []
-    used = 0
-    for chunk in reversed(chunks):
-        if used + len(chunk) > max_chars:
-            if not selected:
-                selected.append(chunk[-(max_chars - used):])
-            break
-        selected.append(chunk)
-        used += len(chunk) + 1
-        if used >= max_chars:
-            break
+    last = chunks[-1][:3000]
 
-    selected.reverse()
-    return "\n\n---\n\n".join(selected)
+    # If last message is a short one-liner, also show the previous one for context
+    if len(last) < 80 and len(chunks) >= 2:
+        prev = chunks[-2][:2000]
+        return f"{prev}\n\n---\n\n{last}"
+
+    return last
 
 
 def main():
