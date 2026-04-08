@@ -74,10 +74,13 @@ def main():
     decision = data.get("decision", "approve")
 
     if decision == "block":
+        print(f"[whip] ❌ Отклонено: {tool_name}", file=sys.stderr)
         print(json.dumps({
             "decision": "block",
             "reason": data.get("reason", "Отклонено через Telegram"),
         }))
+    else:
+        print(f"[whip] ✅ Разрешено: {tool_name}", file=sys.stderr)
 
     sys.exit(0)
 

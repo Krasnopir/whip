@@ -105,7 +105,8 @@ async def stop(request: Request):
         [{"text": "✅ Стоп, всё готово", "data": "done"}],
     ]
 
-    await state.tg.send(text, buttons, rid)
+    msg_id = await state.tg.send(text, buttons, rid)
+    state.pending[rid]["message_id"] = msg_id
     log.info("Stop hook [%s] waiting for Telegram...", rid)
 
     try:

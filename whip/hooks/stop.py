@@ -64,8 +64,11 @@ def main():
     message = data.get("message", "").strip()
 
     if action == "continue" and message:
+        print(f"\n[whip] ▶ {message}", file=sys.stderr)
         # Printing to stdout makes Claude Code treat this as a new user message
         print(message)
+    else:
+        print("[whip] ✅ Стоп", file=sys.stderr)
 
     sys.exit(0)
 

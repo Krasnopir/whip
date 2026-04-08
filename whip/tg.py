@@ -1,10 +1,28 @@
 """Telegram API polling and messaging."""
 import asyncio
 import logging
+import pathlib
 
 import httpx
 
 log = logging.getLogger("whip.tg")
+
+_OFFSET_FILE = pathlib.Path.home() / ".whip" / "tg_offset"
+
+
+def _load_offset() -> int:
+    try:
+        return int(_OFFSET_FILE.read_text().strip())
+    except Exception:
+        return 0
+
+
+def _save_offset(offset: int) -> None:
+    try:
+        _OFFSET_FILE.parent.mkdir(parents=True, exist_ok=True)
+        _OFFSET_FILE.write_text(str(offset))
+    except Exception:
+        pass
 
 
 class TelegramBridge:
@@ -14,7 +32,7 @@ class TelegramBridge:
         self.token = config["telegram_token"]
         self.chat_id = str(config["telegram_chat_id"])
         self.state = state
-        self.offset = 0
+        self.offset = _load_offset()
         self.base = f"https://api.telegram.org/bot{self.token}"
 
     # ------------------------------------------------------------------ send
@@ -26,7 +44,8 @@ class TelegramBridge:
             text = text.replace(ch, f"\\{ch}")
         return text
 
-    async def send(self, text: str, buttons: list[list[dict]], request_id: str) -> None:
+    async def send(self, text: str, buttons: list[list[dict]], request_id: str) -> int | None:
+        """Send message with inline keyboard. Returns message_id for later editing."""
         keyboard = {
             "inline_keyboard": [
                 [{"text": b["text"], "callback_data": f"{request_id}:{b['data']}"} for b in row]
@@ -34,7 +53,6 @@ class TelegramBridge:
             ]
         }
         async with httpx.AsyncClient() as client:
-            # Try MarkdownV2 first, fall back to plain text if Telegram rejects
             r = await client.post(
                 f"{self.base}/sendMessage",
                 json={
@@ -45,19 +63,43 @@ class TelegramBridge:
                 },
                 timeout=30,
             )
-            if not r.json().get("ok"):
-                # Fallback: send as plain text, no formatting
+            data = r.json()
+            if not data.get("ok"):
+                # Fallback: plain text
                 r = await client.post(
                     f"{self.base}/sendMessage",
-                    json={
-                        "chat_id": self.chat_id,
-                        "text": text,
-                        "reply_markup": keyboard,
-                    },
+                    json={"chat_id": self.chat_id, "text": text, "reply_markup": keyboard},
                     timeout=30,
                 )
-                if not r.json().get("ok"):
-                    log.warning("TG sendMessage failed: %s", r.text)
+                data = r.json()
+            if data.get("ok"):
+                return data["result"]["message_id"]
+            log.warning("TG sendMessage failed: %s", r.text)
+            return None
+
+    async def _edit_after_tap(self, message_id: int, original_text: str, chosen_label: str) -> None:
+        """Replace buttons with a single line showing what was tapped."""
+        new_text = f"{original_text}\n\n▶ {chosen_label}"
+        async with httpx.AsyncClient() as client:
+            # Remove keyboard + append choice to message text
+            r = await client.post(
+                f"{self.base}/editMessageText",
+                json={
+                    "chat_id": self.chat_id,
+                    "message_id": message_id,
+                    "text": new_text,
+                    "parse_mode": "Markdown",
+                    "reply_markup": {"inline_keyboard": []},
+                },
+                timeout=10,
+            )
+            if not r.json().get("ok"):
+                # Fallback: just remove the keyboard
+                await client.post(
+                    f"{self.base}/editMessageReplyMarkup",
+                    json={"chat_id": self.chat_id, "message_id": message_id, "reply_markup": {"inline_keyboard": []}},
+                    timeout=10,
+                )
 
     async def send_plain(self, text: str) -> None:
         async with httpx.AsyncClient() as client:
@@ -87,6 +129,7 @@ class TelegramBridge:
                 if data.get("ok"):
                     for update in data.get("result", []):
                         self.offset = update["update_id"] + 1
+                        _save_offset(self.offset)
                         await self._handle(update)
             except Exception as e:
                 log.debug("Poll error: %s", e)
@@ -101,7 +144,6 @@ class TelegramBridge:
             await self._handle_message(update["message"])
 
     async def _handle_callback(self, query: dict) -> None:
-        # Acknowledge immediately so Telegram removes the loading spinner
         async with httpx.AsyncClient() as client:
             await client.post(
                 f"{self.base}/answerCallbackQuery",
@@ -115,18 +157,43 @@ class TelegramBridge:
 
         request_id, action = data.split(":", 1)
         pending = self.state.pending.get(request_id)
+
+        # Stale button from an old message — just wipe the keyboard silently
         if not pending:
+            msg_id = query.get("message", {}).get("message_id")
+            if msg_id:
+                async with httpx.AsyncClient() as client:
+                    await client.post(
+                        f"{self.base}/editMessageReplyMarkup",
+                        json={"chat_id": self.chat_id, "message_id": msg_id,
+                              "reply_markup": {"inline_keyboard": []}},
+                        timeout=10,
+                    )
             return
 
         kind = pending["type"]
+        msg_id = query.get("message", {}).get("message_id")
+        original_text = query.get("message", {}).get("text", "")
+
+        # Label map for what to show after tap
+        labels = {
+            "continue":    "Ебаш дальше",
+            "custom":      "Пишу команду...",
+            "done":        "Стоп",
+            "approve":     "Разрешил",
+            "approve_all": "Разрешил всё",
+            "deny":        "Отклонил",
+        }
+        chosen_label = labels.get(action, action)
 
         if kind == "stop":
             if action == "continue":
                 pending["response"] = {"action": "continue", "message": "продолжай"}
             elif action == "custom":
-                # Mark as waiting for text reply
                 pending["awaiting_text"] = True
-                await self.send_plain("Напиши команду — отправлю агенту:")
+                if msg_id:
+                    await self._edit_after_tap(msg_id, original_text, chosen_label)
+                await self.send_plain("✏️ Напиши команду — отправлю агенту:")
                 return
             else:
                 pending["response"] = {"action": "done", "message": ""}
@@ -137,9 +204,11 @@ class TelegramBridge:
             elif action == "approve_all":
                 self.state.approve_all = True
                 pending["response"] = {"decision": "approve"}
-                await self.send_plain("🔥 Режим «да на всё» включён до конца сессии")
-            else:  # deny
+            else:
                 pending["response"] = {"decision": "block", "reason": "Отклонено через Telegram"}
+
+        if msg_id:
+            await self._edit_after_tap(msg_id, original_text, chosen_label)
 
         pending["event"].set()
 

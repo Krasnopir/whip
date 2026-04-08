@@ -1,106 +1,165 @@
 # whip
 
-Remote control for AI coding agents (Claude Code, Codex, anything) via Telegram.
-
-When the agent finishes a task → you get a Telegram message with a summary and buttons.
-When the agent asks for approval → same thing. You click from the couch.
+Управляй AI-агентами с телефона через Telegram. Лежишь на диване — агент спрашивает разрешения или закончил задачу — нажимаешь кнопку прямо в чате.
 
 ```
-Agent stops  →  Telegram message
-                 [🚀 Ебаш дальше]
-                 [✏️ Написать команду]
-                 [✅ Стоп]
+Агент закончил → в Telegram:
 
-Agent wants to edit a file / run bash?  →  Telegram message
-                 [✅ Да]  [❌ Нет]
-                 [🔥 Да на всё в этой сессии]
+  ✅ Агент закончил
+
+  Сделал рефактор auth модуля, вынес логику в сервис...
+
+  📁 /workspace/myproject
+
+  [🚀 Ебаш дальше]
+  [✏️ Написать команду]
+  [✅ Стоп, всё готово]
+
+Нажал "Ебаш дальше" → агент продолжает
+Написал текст → летит агенту как следующая команда
 ```
 
-## Install
+```
+Агент хочет выполнить rm -rf / → в Telegram:
+
+  🔧 Разрешить?
+  Bash
+  $ rm -rf /tmp/old_build
+
+  [✅ Да]  [❌ Нет]
+  [🔥 Да на всё в этой сессии]
+```
+
+После нажатия кнопки — сообщение редактируется, кнопки скрываются, видно что выбрал.  
+В терминале показывает `[whip] ▶ продолжай`.
+
+---
+
+## Быстрый старт
+
+### 1. Создай Telegram бота
+
+1. Напиши [@BotFather](https://t.me/BotFather) → `/newbot` → получи **токен**
+2. Напиши [@userinfobot](https://t.me/userinfobot) → получи свой **chat ID**
+3. Найди своего бота и напиши ему `/start`
+
+### 2. Установи whip
 
 ```bash
-pip install whip-agent
-```
-
-Or from source:
-
-```bash
-git clone https://github.com/yourname/whip
+git clone https://github.com/Krasnopir/whip.git
 cd whip
+python3 -m venv .venv
+source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -e .
 ```
 
-## Setup
-
-1. Create a Telegram bot via [@BotFather](https://t.me/BotFather) → get token
-2. Get your chat ID from [@userinfobot](https://t.me/userinfobot)
+### 3. Настрой
 
 ```bash
 whip setup
-# prompts for token + chat ID, installs Claude Code hooks automatically
+# → введи токен бота
+# → введи chat ID
+# → автоматически пропишет хуки в Claude Code
 ```
 
-## Usage
+Или вручную создай `~/.whip/.env`:
 
-Start the daemon (keep it running while you work):
-
-```bash
-whip start          # foreground
-whip start -d       # background
-```
-
-That's it. Now just use Claude Code normally — every time it stops you'll get a Telegram message.
-
-## Send from any agent/script
-
-```bash
-whip notify "Finished deploying!" -b "Continue" -b "Rollback"
-```
-
-Works from bash, Python, Makefile, whatever. Use it with Codex too.
-
-## How it works
-
-```
-Claude Code hooks (Stop / PreToolUse)
-        │
-        ▼  HTTP POST (blocks until user responds)
-whip daemon (localhost:7331)
-        │
-        ▼  Telegram Bot API (long-polling)
-Your phone
-```
-
-- **Stop hook** — fires when Claude Code finishes. Daemon holds the connection open,
-  sends a Telegram message, waits. When you tap a button or type a reply, the hook
-  receives it and either lets the agent stop or injects your message as a new user turn.
-
-- **PreToolUse hook** — fires before destructive operations (bash rm/push, file writes, etc.).
-  You approve or deny from Telegram. "Да на всё" approves everything until the session ends.
-
-- **`whip notify`** — a CLI command any script can call to fire a message without hooks.
-
-## Config
-
-`~/.whip/.env`:
-
-```
-WHIP_TELEGRAM_TOKEN=...
-WHIP_TELEGRAM_CHAT_ID=...
+```env
+WHIP_TELEGRAM_TOKEN=1234567890:ABCdef...
+WHIP_TELEGRAM_CHAT_ID=123456789
 WHIP_DAEMON_PORT=7331
 WHIP_TIMEOUT=1800
 ```
 
-## Commands
+### 4. Запусти демон
+
+```bash
+whip start        # в отдельном терминале
+# или в фоне:
+whip start -d
+```
+
+Всё. Теперь запускай Claude Code в любом проекте — управление прилетает в телефон.
+
+---
+
+## Как работает
 
 ```
-whip setup          Configure + install Claude Code hooks
-whip start          Start daemon (foreground)
-whip start -d       Start daemon (background)
-whip stop-daemon    Stop background daemon
-whip status         Check if daemon is running
-whip notify TEXT    Send notification to Telegram
+Claude Code
+   │ Stop hook (агент закончил)
+   │ PreToolUse hook (агент хочет запустить команду)
+   ▼
+whip daemon (localhost:7331)   ← FastAPI, крутится локально
+   │
+   ▼ Telegram Bot API (long-polling, без webhook)
+Твой телефон
 ```
+
+**Stop hook** — когда Claude Code заканчивает задачу, перехватывает момент и шлёт резюме в Telegram. Держит соединение открытым пока не нажмёшь кнопку (до 30 мин). Если нажал "Ебаш дальше" — агент получает команду и продолжает. Написал текст — летит как следующая инструкция.
+
+**PreToolUse hook** — перехватывает потенциально опасные bash-команды (`rm`, `git push`, `git reset --hard`, `sudo`, и т.д.). "Да на всё" — включает режим автоапрува до конца сессии.
+
+**Никакого облака** — всё локально, Telegram только как транспорт.
+
+---
+
+## Команды
+
+```bash
+whip setup          # настройка + установка хуков в Claude Code
+whip start          # запустить демон (foreground)
+whip start -d       # запустить в фоне
+whip stop-daemon    # остановить фоновый демон
+whip status         # проверить что демон жив
+whip notify "текст" # отправить сообщение вручную (работает с любым агентом)
+whip notify "готово" -b "Продолжить" -b "Стоп"  # с кнопками
+```
+
+---
+
+## Интеграция с Codex и другими агентами
+
+Для любого агента без встроенных хуков используй `whip notify`:
+
+```bash
+# После завершения задачи
+codex "сделай тудулист" && whip notify "Codex закончил!" -b "Ебаш дальше" -b "Стоп"
+```
+
+Или в скрипте:
+
+```bash
+#!/bin/bash
+your-agent "$@"
+whip notify "Агент закончил задачу: $1" -b "Продолжить" -b "Стоп"
+```
+
+---
+
+## Автозапуск (macOS)
+
+Чтобы демон стартовал сам при входе в систему, добавь в `~/.zshrc`:
+
+```bash
+pgrep -f "uvicorn whip.daemon" > /dev/null || \
+  nohup /path/to/whip/.venv/bin/python \
+  -m uvicorn whip.daemon:app --host 127.0.0.1 --port 7331 \
+  >> ~/.whip/daemon.log 2>&1 &
+```
+
+---
+
+## Конфиг
+
+| Переменная | По умолчанию | Описание |
+|---|---|---|
+| `WHIP_TELEGRAM_TOKEN` | — | Токен бота от BotFather |
+| `WHIP_TELEGRAM_CHAT_ID` | — | Твой chat ID |
+| `WHIP_DAEMON_PORT` | `7331` | Порт демона |
+| `WHIP_TIMEOUT` | `1800` | Таймаут ожидания ответа (сек) |
+
+---
 
 ## License
 
