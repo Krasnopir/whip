@@ -11,3 +11,4 @@ venv/
 .whip/
 *.log
 .DS_Store
+.idea/
