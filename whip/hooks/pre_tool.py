@@ -9,12 +9,16 @@ import json
 import os
 import sys
 
-ALWAYS_ALLOW = {
+# Пусто: при WHIP_PRETOOL_MODE=all апрувится вообще всё (как ты просил).
+# Чтобы снова белый список «тихих» тулов: WHIP_PRETOOL_MODE=safe_reads
+_SAFE_READS = {
     "Read", "Glob", "Grep", "LS",
     "TodoRead", "TodoWrite",
     "WebSearch", "WebFetch",
     "NotebookRead",
 }
+
+ALWAYS_ALLOW: set[str] = set()
 
 DANGEROUS_BASH = [
     "rm ", "rmdir", "unlink",
@@ -33,11 +37,29 @@ def is_dangerous_bash(cmd: str) -> bool:
 
 
 def should_ask(tool_name: str, tool_input: dict) -> bool:
-    if tool_name in ALWAYS_ALLOW:
+    """
+    WHIP_PRETOOL_MODE (по умолчанию all — каждый тул в Telegram):
+      all — всё подряд (кроме off)
+      safe_reads — как раньше белый список чтения/поиска без апрува
+      all_bash — только Bash
+      dangerous — только «опасный» bash
+      off — не спрашивать
+    """
+    mode = os.getenv("WHIP_PRETOOL_MODE", "all").strip().lower()
+    allow = ALWAYS_ALLOW | (_SAFE_READS if mode == "safe_reads" else set())
+    if tool_name in allow:
         return False
-    if tool_name == "Bash":
-        return is_dangerous_bash(tool_input.get("command", ""))
-    return False
+    if mode in ("off", "none", "0", "false", "no"):
+        return False
+    if mode in ("all", "everything"):
+        return True
+    if mode in ("all_bash", "bash"):
+        return tool_name == "Bash"
+    if mode in ("dangerous",):
+        if tool_name == "Bash":
+            return is_dangerous_bash(tool_input.get("command", ""))
+        return False
+    return True
 
 
 def main():
@@ -57,7 +79,10 @@ def main():
     port = os.getenv("WHIP_DAEMON_PORT", "7331")
     host = os.getenv("WHIP_DAEMON_HOST", "127.0.0.1")
     cwd = payload.get("cwd", os.getcwd())
-    preview = tool_input.get("command", "")[:80] if tool_name == "Bash" else ""
+    if tool_name == "Bash":
+        preview = tool_input.get("command", "")[:100]
+    else:
+        preview = str(tool_input)[:100]
 
     # Print to terminal — user can approve from another tab
     sys.stderr.write(

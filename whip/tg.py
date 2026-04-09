@@ -1,13 +1,212 @@
 """Telegram API polling and messaging."""
 import asyncio
+import json
 import logging
 import pathlib
+import re
+from typing import Any
 
 import httpx
 
 log = logging.getLogger("whip.tg")
 
+_TELEGRAM_TEXT_LIMIT = 4090
+
+
+def _truncate_tg(text: str) -> str:
+    if len(text) <= _TELEGRAM_TEXT_LIMIT:
+        return text
+    return text[: _TELEGRAM_TEXT_LIMIT - 20] + "\n… (обрезано)"
+
+
+def _collect_strings(obj: Any, out: list[str], needle: str) -> None:
+    if isinstance(obj, dict):
+        for v in obj.values():
+            _collect_strings(v, out, needle)
+    elif isinstance(obj, list):
+        for v in obj:
+            _collect_strings(v, out, needle)
+    elif isinstance(obj, str) and needle in obj:
+        out.append(obj.strip())
+
 _OFFSET_FILE = pathlib.Path.home() / ".whip" / "tg_offset"
+
+# Подсказка в Telegram, если не задан WHIP_CLAUDE_WEB_COOKIE (это не JWT — сырые Cookie браузера).
+CLAUDE_COOKIE_HOWTO = (
+    "Нет WHIP_CLAUDE_WEB_COOKIE в ~/.whip/.env\n\n"
+    "Это не JWT. Это одна длинная строка «Cookie», как отправляет браузер на claude.ai "
+    "пока ты залогинен.\n\n"
+    "Chrome / Brave / Edge:\n"
+    "• Открой https://claude.ai и войди в аккаунт\n"
+    "• F12 (DevTools) → вкладка Network\n"
+    "• Обнови страницу (F5)\n"
+    "• Кликни запрос с именем claude.ai или document (первая строка)\n"
+    "• Headers → Request Headers → найди cookie: (или Cookie:)\n"
+    "• Скопируй всё значение после cookie: — целиком одной строкой\n\n"
+    "Firefox: F12 → Сеть → запрос → Заголовки → Cookie.\n"
+    "Safari: включи меню «Разработка» → Web Inspector → Network — то же.\n\n"
+    "В ~/.whip/.env добавь строку без кавычек:\n"
+    "WHIP_CLAUDE_WEB_COOKIE=sessionKey=...; другие=значения; ...\n\n"
+    "Перезапусти whip start. Храни как пароль."
+)
+
+
+async def get_claude_usage_html() -> tuple[str | None, str]:
+    """
+    GET claude.ai/settings/usage с cookie. Возвращает (html, ошибка).
+    html is None при ошибке.
+    """
+    import os
+
+    cookie = os.environ.get("WHIP_CLAUDE_WEB_COOKIE", "").strip()
+    url = os.environ.get("WHIP_CLAUDE_USAGE_URL", "https://claude.ai/settings/usage").strip()
+    if not cookie:
+        return None, CLAUDE_COOKIE_HOWTO
+
+    try:
+        async with httpx.AsyncClient() as client:
+            r = await client.get(
+                url,
+                headers={
+                    "Cookie": cookie,
+                    "User-Agent": (
+                        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                    ),
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                },
+                timeout=25,
+                follow_redirects=True,
+            )
+    except Exception as e:
+        log.debug("Claude web usage fetch error: %s", e)
+        return None, f"Не удалось открыть страницу: {e}"
+
+    if r.status_code != 200:
+        return None, (
+            f"claude.ai ответил HTTP {r.status_code}.\n"
+            "Обычно сессия протухла: снова зайди в claude.ai, F12 → Network → "
+            "запрос → Headers → скопируй строку cookie в WHIP_CLAUDE_WEB_COOKIE."
+        )
+
+    return r.text, ""
+
+
+def parse_resets_in_seconds_from_blob(blob: str) -> int | None:
+    """Парсит фрагменты вида «Resets in 3 hr 51 min», «Resets in 2 days» → секунды до события."""
+    blob = re.sub(r"\s+", " ", blob.replace("\xa0", " ").strip())
+    m = re.search(r"resets?\s+in\s+(\d+)\s*(?:day|days)\b", blob, re.I)
+    if m:
+        d = int(m.group(1))
+        if 0 < d <= 14:
+            return d * 86400
+    m = re.search(
+        r"resets?\s+in\s+(?:(\d+)\s*(?:hr|h|hours?)\s*)?(?:(\d+)\s*(?:min|m|minutes?))?",
+        blob,
+        re.I,
+    )
+    if m:
+        h_raw, mn_raw = m.group(1), m.group(2)
+        h = int(h_raw) if h_raw else 0
+        mn = int(mn_raw) if mn_raw else 0
+        if h == 0 and mn == 0:
+            return None
+        sec = h * 3600 + mn * 60
+        if 0 < sec <= 14 * 86400:
+            return sec
+    return None
+
+
+def scrape_reset_seconds_from_usage_html(html: str) -> int | None:
+    """Ищет время до ресета в HTML и в __NEXT_DATA__."""
+    # 1) JSON страницы
+    m = re.search(
+        r'<script id="__NEXT_DATA__"\s*type="application/json">([^<]+)</script>',
+        html,
+    )
+    if m:
+        try:
+            payload = json.loads(m.group(1))
+            hits: list[str] = []
+            for needle in ("Resets in", "resets in", "reset in"):
+                _collect_strings(payload, hits, needle)
+            for s in hits:
+                sec = parse_resets_in_seconds_from_blob(s)
+                if sec is not None:
+                    return sec
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+    # 2) regex по сырому HTML
+    for mm in re.finditer(r"Resets in[^<]{0,160}", html, re.I):
+        sec = parse_resets_in_seconds_from_blob(mm.group(0))
+        if sec is not None:
+            return sec
+
+    return parse_resets_in_seconds_from_blob(html)
+
+
+def usage_snippets_from_html(html: str) -> str:
+    """Текст для /limits (без API)."""
+    snippets: list[str] = []
+
+    m = re.search(
+        r'<script id="__NEXT_DATA__"\s*type="application/json">([^<]+)</script>',
+        html,
+    )
+    if m:
+        try:
+            payload = json.loads(m.group(1))
+            hits: list[str] = []
+            for needle in ("Resets in", "resets in", "Current session", "% used", "used ("):
+                _collect_strings(payload, hits, needle)
+            for s in hits:
+                s = " ".join(s.split())
+                if 8 < len(s) < 600 and s not in snippets:
+                    if any(
+                        k in s
+                        for k in ("Resets", "reset", "session", "used", "limit", "%")
+                    ):
+                        snippets.append(s)
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+    for pattern in (
+        r"Current session[^\n<]{0,160}",
+        r"Resets in[^<\n]{5,160}",
+        r"Session[^\n<]{0,80}Resets[^<\n]{5,120}",
+        r"\d{1,3}\s*%\s*used",
+    ):
+        for mm in re.finditer(pattern, html, re.IGNORECASE):
+            frag = " ".join(mm.group(0).split())
+            if frag and frag not in snippets:
+                snippets.append(frag[:240])
+
+    if not snippets:
+        return (
+            "\n\n🌐 claude.ai: не нашёл на странице «Resets in» / «% used» "
+            "(вёрстка могла поменяться)."
+        )
+
+    seen: set[str] = set()
+    uniq: list[str] = []
+    for s in snippets:
+        key = s[:100]
+        if key not in seen:
+            seen.add(key)
+            uniq.append(s)
+
+    body = "\n".join(f"• {s}" for s in uniq[:15])
+    return f"\n\n🌐 claude.ai:\n{body}"
+
+
+async def fetch_claude_web_usage_block() -> str:
+    html, err = await get_claude_usage_html()
+    if err:
+        return f"\n\n⚠️ {err}"
+    if not html:
+        return "\n\n⚠️ Пустой ответ от claude.ai."
+    return usage_snippets_from_html(html)
 
 
 def _load_offset() -> int:
@@ -37,15 +236,9 @@ class TelegramBridge:
 
     # ------------------------------------------------------------------ send
 
-    @staticmethod
-    def _escape(text: str) -> str:
-        """Escape special chars for Telegram MarkdownV2."""
-        for ch in r"\_*[]()~`>#+-=|{}.!":
-            text = text.replace(ch, f"\\{ch}")
-        return text
-
     async def send(self, text: str, buttons: list[list[dict]], request_id: str) -> int | None:
         """Send message with inline keyboard. Returns message_id for later editing."""
+        text = _truncate_tg(text)
         keyboard = {
             "inline_keyboard": [
                 [{"text": b["text"], "callback_data": f"{request_id}:{b['data']}"} for b in row]
@@ -53,25 +246,17 @@ class TelegramBridge:
             ]
         }
         async with httpx.AsyncClient() as client:
+            # Plain text only — Markdown breaks on arbitrary code/paths and drops the message.
             r = await client.post(
                 f"{self.base}/sendMessage",
                 json={
                     "chat_id": self.chat_id,
                     "text": text,
                     "reply_markup": keyboard,
-                    "parse_mode": "Markdown",
                 },
                 timeout=30,
             )
             data = r.json()
-            if not data.get("ok"):
-                # Fallback: plain text
-                r = await client.post(
-                    f"{self.base}/sendMessage",
-                    json={"chat_id": self.chat_id, "text": text, "reply_markup": keyboard},
-                    timeout=30,
-                )
-                data = r.json()
             if data.get("ok"):
                 return data["result"]["message_id"]
             log.warning("TG sendMessage failed: %s", r.text)
@@ -79,22 +264,19 @@ class TelegramBridge:
 
     async def _edit_after_tap(self, message_id: int, original_text: str, chosen_label: str) -> None:
         """Replace buttons with a single line showing what was tapped."""
-        new_text = f"{original_text}\n\n▶ {chosen_label}"
+        new_text = _truncate_tg(f"{original_text}\n\n▶ {chosen_label}")
         async with httpx.AsyncClient() as client:
-            # Remove keyboard + append choice to message text
             r = await client.post(
                 f"{self.base}/editMessageText",
                 json={
                     "chat_id": self.chat_id,
                     "message_id": message_id,
                     "text": new_text,
-                    "parse_mode": "Markdown",
                     "reply_markup": {"inline_keyboard": []},
                 },
                 timeout=10,
             )
             if not r.json().get("ok"):
-                # Fallback: just remove the keyboard
                 await client.post(
                     f"{self.base}/editMessageReplyMarkup",
                     json={"chat_id": self.chat_id, "message_id": message_id, "reply_markup": {"inline_keyboard": []}},
@@ -102,10 +284,11 @@ class TelegramBridge:
                 )
 
     async def send_plain(self, text: str) -> None:
+        text = _truncate_tg(text)
         async with httpx.AsyncClient() as client:
             await client.post(
                 f"{self.base}/sendMessage",
-                json={"chat_id": self.chat_id, "text": text, "parse_mode": "Markdown"},
+                json={"chat_id": self.chat_id, "text": text},
                 timeout=30,
             )
 
@@ -188,7 +371,7 @@ class TelegramBridge:
 
         if kind == "stop":
             if action == "continue":
-                pending["response"] = {"action": "continue", "message": "продолжай", "source": "tg"}
+                pending["response"] = {"action": "continue", "message": "ебаш дальше", "source": "tg"}
             elif action == "custom":
                 pending["awaiting_text"] = True
                 if msg_id:
@@ -224,21 +407,10 @@ class TelegramBridge:
             await self._handle_command(text, msg)
             return
 
-        # "reset 4h40m" shortcut — schedule a rate-limit reminder
-        if text.lower().startswith("reset "):
-            await self._handle_reset_shortcut(text)
-            return
-
-        # /ebash echo test — if active, just echo back and done
-        if self.state.ebash_echo:
-            self.state.ebash_echo = False
-            await self.send_plain(f"✅ Получил: {text}")
-            return
-
         # Find a pending request that's waiting for text input
         log.info("TG msg: %r | pending: %s", text[:60],
                  [(r, p["type"], p.get("awaiting_text")) for r, p in self.state.pending.items()])
-        for rid, pending in list(self.state.pending.items()):
+        for rid, pending in reversed(list(self.state.pending.items())):
             if pending.get("awaiting_text"):
                 log.info("Routing text to awaiting_text pending %s", rid)
                 pending["awaiting_text"] = False
@@ -259,113 +431,59 @@ class TelegramBridge:
         log.info("TG msg: no pending to route to, ignoring")
         await self.send_plain("⚪ Агент не ожидает команд сейчас.")
 
-    async def _fetch_rate_limits(self) -> str:
-        """
-        Call Anthropic count_tokens (cheap, no output generated) to read
-        the rate-limit response headers and format them for /limits.
-        Returns a string to embed in the TG message, or fallback to local stats.
-        """
-        import os as _os, json as _json, pathlib as _pl
-        from datetime import date, datetime, timezone
-
-        api_key = _os.environ.get("ANTHROPIC_API_KEY", "")
-        if api_key:
-            try:
-                async with httpx.AsyncClient() as client:
-                    r = await client.post(
-                        "https://api.anthropic.com/v1/messages/count_tokens",
-                        headers={
-                            "x-api-key": api_key,
-                            "anthropic-version": "2023-06-01",
-                            "content-type": "application/json",
-                        },
-                        json={
-                            "model": "claude-opus-4-6",
-                            "messages": [{"role": "user", "content": "hi"}],
-                        },
-                        timeout=10,
-                    )
-                h = r.headers
-                tok_limit = h.get("anthropic-ratelimit-tokens-limit", "")
-                tok_rem   = h.get("anthropic-ratelimit-tokens-remaining", "")
-                tok_reset = h.get("anthropic-ratelimit-tokens-reset", "")
-                req_limit = h.get("anthropic-ratelimit-requests-limit", "")
-                req_rem   = h.get("anthropic-ratelimit-requests-remaining", "")
-
-                lines = []
-                if tok_limit and tok_rem:
-                    used = int(tok_limit) - int(tok_rem)
-                    pct = int(used / int(tok_limit) * 100)
-                    lines.append(f"Токены: {used:,}/{int(tok_limit):,} ({pct}% использовано)")
-                if req_limit and req_rem:
-                    used_r = int(req_limit) - int(req_rem)
-                    lines.append(f"Запросы: {used_r}/{req_limit}")
-                if tok_reset:
-                    # ISO 8601 → local time
-                    try:
-                        dt = datetime.fromisoformat(tok_reset.replace("Z", "+00:00"))
-                        local = dt.astimezone().strftime("%H:%M")
-                        lines.append(f"Ресет лимитов: {local}")
-                    except Exception:
-                        lines.append(f"Ресет: {tok_reset}")
-                if lines:
-                    return "\n\n📡 *Лимиты (live):*\n" + "\n".join(lines)
-            except Exception as e:
-                log.debug("Rate limit fetch error: %s", e)
-
-        # Fallback: local stats-cache.json
-        stats_path = _pl.Path.home() / ".claude" / "stats-cache.json"
-        try:
-            stats = _json.loads(stats_path.read_text())
-            today_str = date.today().isoformat()
-            for entry in stats.get("dailyModelTokens", []):
-                if entry.get("date") == today_str:
-                    tokens = entry.get("tokensByModel", {})
-                    total_tok = sum(tokens.values())
-                    model_lines = "\n".join(
-                        f"  {m.split('-')[1] if '-' in m else m}: {v:,}"
-                        for m, v in tokens.items()
-                    )
-                    return f"\n\n📊 *Токены сегодня:* {total_tok:,}\n{model_lines}"
-        except Exception:
-            pass
-        return "\n\n_(нет данных — добавь ANTHROPIC_API_KEY в ~/.whip/.env для live-лимитов)_"
-
-    async def _handle_reset_shortcut(self, text: str) -> None:
-        """Handle 'reset 4h40m' plain-text shortcut from TG."""
-        duration = text.split(None, 1)[1].strip()
-        import re, time as _t
-        from . import daemon as _d
-        total = 0
-        for val, unit in re.findall(r"(\d+)([hms])", duration.lower()):
-            v = int(val)
-            if unit == "h": total += v * 3600
-            elif unit == "m": total += v * 60
-            elif unit == "s": total += v
-        if not total:
-            await self.send_plain(f"Не могу разобрать: {duration!r}  (формат: 4h40m / 30m / 2h)")
-            return
-        fire_at = _t.time() + total
-        msg_text = "🔄 Сессия Claude обновилась! Можно снова."
-        # Replace existing reset schedule (always single instance)
-        _d._save_schedules([{"fire_at": fire_at, "text": msg_text}])
-        from datetime import datetime, timedelta
-        dt = datetime.now() + timedelta(seconds=total)
-        await self.send_plain(f"✅ Напомню в {dt.strftime('%H:%M')} (через {duration})")
-
     async def _handle_command(self, text: str, msg: dict) -> None:
-        cmd = text.split()[0].lower().split("@")[0]  # strip @botname suffix
+        parts_cmd = text.split(maxsplit=1)
+        cmd = parts_cmd[0].lower().split("@")[0]  # strip @botname suffix
+        rest = parts_cmd[1].strip() if len(parts_cmd) > 1 else ""
 
-        if cmd == "/ebash":
-            # Find pending stop and set awaiting_text, or enable echo test
+        if cmd.startswith("/ebash"):
+            # /ebash           — route to most recent stop
+            # /ebash:whip      — route to project "whip" specifically
+            # /ebash text      — send text to most recent stop immediately
+            # /ebash:whip text — send text to "whip" project stop
+            target_project: str | None = None
+            if ":" in cmd:
+                target_project = cmd.split(":", 1)[1]  # "/ebash:whip" → "whip"
+
+            # Find matching pending stop
+            matched_rid = None
             for rid, pending in reversed(list(self.state.pending.items())):
-                if pending["type"] == "stop":
-                    pending["awaiting_text"] = True
-                    await self.send_plain("✏️ Напиши команду — отправлю агенту:")
-                    return
-            # No active agent — echo test mode
-            self.state.ebash_echo = True
-            await self.send_plain("✏️ Напиши что-нибудь — проверим что доходит:")
+                if pending["type"] != "stop":
+                    continue
+                if target_project is None or pending.get("project") == target_project:
+                    matched_rid = rid
+                    break
+
+            if matched_rid is None:
+                if target_project:
+                    # List active projects so user knows what's available
+                    active = [p.get("project", "?") for p in self.state.pending.values() if p["type"] == "stop"]
+                    if active:
+                        await self.send_plain(
+                            f"⚪ Проект «{target_project}» сейчас не активен.\n"
+                            f"Активные стопы: {', '.join(active)}"
+                        )
+                    else:
+                        await self.send_plain(f"⚪ Проект «{target_project}» не активен (нет ни одного стопа).")
+                else:
+                    await self.send_plain("⚪ Агент сейчас не в стопе — некому отправлять команду.")
+                return
+
+            pending = self.state.pending[matched_rid]
+            proj_name = pending.get("project", "?")
+
+            if rest:
+                # Send text immediately to this pending
+                pending["awaiting_text"] = False
+                pending["response"] = {"action": "continue", "message": rest, "source": "tg"}
+                pending["event"].set()
+                await self.send_plain(f"✅ [{proj_name}] Передал агенту: {rest[:200]}")
+            else:
+                # Prompt for text
+                pending["awaiting_text"] = True
+                await self.send_plain(
+                    f"✏️ [{proj_name}] Напиши команду:"
+                )
             return
 
         if cmd == "/status" or cmd == "/start":
@@ -373,46 +491,63 @@ class TelegramBridge:
             approve_all = "🔥 да на всё" if self.state.approve_all else "выкл"
             project = self.state.last_cwd.split("/")[-1] if self.state.last_cwd else "—"
             await self.send_plain(
-                f"🎯 *Whip работает*\n\n"
-                f"Проект: `{project}`\n"
+                f"🎯 Whip работает\n\n"
+                f"Проект: {project}\n"
                 f"Ожидает: {pending_count}\n"
                 f"Approve all: {approve_all}"
             )
 
         elif cmd == "/reset":
-            # Show scheduled reset or ask to set one
             from . import daemon as _d
-            items = _d._load_schedules()
             import time as _t
-            if items:
-                lines = []
-                for i in items:
-                    secs = max(0, int(i["fire_at"] - _t.time()))
-                    h, rem = divmod(secs, 3600)
-                    m, s = divmod(rem, 60)
-                    lines.append(f"⏱ через {h}h{m}m — {i['text']}")
-                await self.send_plain("📅 *Запланировано:*\n\n" + "\n".join(lines))
-            else:
+            from datetime import datetime, timedelta
+
+            existing = _d.load_claude_auto_reset()
+            if existing:
+                secs = max(0, int(existing["fire_at"] - _t.time()))
+                h, rem = divmod(secs, 3600)
+                m, s = divmod(rem, 60)
+                at = datetime.fromtimestamp(existing["fire_at"])
                 await self.send_plain(
-                    "⏱ *Нет запланированных уведомлений*\n\n"
-                    "Напиши время до ресета:\n"
-                    "`reset 4h40m` — и я запомню"
+                    f"⏱ Уже стоит напоминание по лимитам (с claude.ai):\n"
+                    f"осталось {h}h {m}m {s}s → в {at.strftime('%d.%m %H:%M')}\n"
+                    f"{existing.get('text', '')}"
                 )
+                return
+
+            html, err = await get_claude_usage_html()
+            if err:
+                await self.send_plain(f"⚠️ {err}")
+                return
+            sec = scrape_reset_seconds_from_usage_html(html or "")
+            if sec is None:
+                await self.send_plain(
+                    "⚠️ На странице не нашёл строку «Resets in …». "
+                    "Проверь /limits — там видно сырой текст; возможно сменилась вёрстка."
+                )
+                return
+            fire_at = _t.time() + sec
+            _d.upsert_claude_auto_reset(fire_at)
+            when = datetime.now() + timedelta(seconds=sec)
+            h, r2 = divmod(sec, 3600)
+            m, _ = divmod(r2, 60)
+            await self.send_plain(
+                f"✅ Снял время с сайта: через {h}h {m}m ({sec // 60} мин).\n"
+                f"Напомню в {when.strftime('%H:%M')} — лимиты обновились."
+            )
 
         elif cmd == "/limits":
             from . import daemon as _d
-            items = _d._load_schedules()
-            import time as _t, os as _os
+            import time as _t
 
-            api_text = await self._fetch_rate_limits()
-
-            reset_text = ""
-            if items:
-                secs = max(0, int(items[0]["fire_at"] - _t.time()))
+            api_text = await fetch_claude_web_usage_block()
+            auto = _d.load_claude_auto_reset()
+            if auto:
+                secs = max(0, int(auto["fire_at"] - _t.time()))
                 h, rem = divmod(secs, 3600)
                 m = rem // 60
-                reset_text = f"\n\n⏱ *Ресет через:* {h}h{m}m\n_Напиши `reset 4h40m` чтобы обновить_"
+                reset_text = f"\n\n⏱ Напоминание о ресете лимитов: через {h}h{m}m"
             else:
-                reset_text = "\n\n⏱ *Ресет:* не задан\n_Напиши `reset 4h40m` чтобы запомнить_"
+                reset_text = "\n\n⏱ Авто-напоминание не запланировано — /reset (берёт время с сайта)"
 
-            await self.send_plain(f"📋 *Лимиты Claude Code*{api_text}{reset_text}")
+            await self.send_plain(f"📋 Лимиты{api_text}{reset_text}")

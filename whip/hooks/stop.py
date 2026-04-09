@@ -91,7 +91,7 @@ def main():
     if summary:
         sys.stderr.write(summary[:1000] + "\n")
     sys.stderr.write(f"\n{'─'*50}\n")
-    sys.stderr.write("[whip]    → whip go  /  whip go 'команда'  /  whip go s  (или в Telegram)\n")
+    sys.stderr.write("[whip]    → whip go  /  /ebash текст  /  кнопки в Telegram\n")
     sys.stderr.flush()
 
     try:
@@ -109,9 +109,12 @@ def main():
     message = data.get("message", "").strip()
     source = data.get("source", "tg")
 
-    if action == "continue" and message:
-        sys.stderr.write(f"[whip] ▶ ({source}): {message}\n")
-        print(message)
+    if action == "continue":
+        msg = message or "продолжай"
+        sys.stderr.write(f"[whip] ▶ ({source}): {msg}\n")
+        # Claude Code Stop hook: JSON {"decision": "block", "reason": "..."} injects
+        # the reason as the next user message and keeps the agent running.
+        print(json.dumps({"decision": "block", "reason": msg}))
     else:
         sys.stderr.write(f"[whip] ✅ Стоп ({source})\n")
 

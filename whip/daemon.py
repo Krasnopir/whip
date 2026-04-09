@@ -38,7 +38,6 @@ class DaemonState:
         self.approve_all: bool = False  # sticky "yes to all" flag
         self.last_cwd: str = ""         # for project name in approve messages
         self.tg: Optional[TelegramBridge] = None
-        self.ebash_echo: bool = False   # /ebash test: echo next TG message back
 
     def new_request(self, kind: str, timeout: int) -> tuple[str, asyncio.Event]:
         rid = uuid.uuid4().hex[:8]
@@ -88,17 +87,44 @@ async def _cleanup_loop():
 
 _SCHEDULE_FILE = pathlib.Path.home() / ".whip" / "schedule.json"
 
+# Единственное авто-напоминание по лимитам claude.ai (из парсинга /reset)
+SCHEDULE_KIND_CLAUDE_AUTO = "claude_auto_reset"
+CLAUDE_RESET_REMINDER_TEXT = "🔄 Лимиты на claude.ai обновились — можно снова."
+
+
+def _normalize_schedule_items(items: list[dict]) -> list[dict]:
+    """
+    Ровно одна запись kind=claude_auto_reset: если накопились дубли — остаётся
+    ближайшая по fire_at (следующее срабатывание).
+    """
+    rest: list[dict] = []
+    auto: list[dict] = []
+    for i in items:
+        if i.get("kind") == SCHEDULE_KIND_CLAUDE_AUTO:
+            auto.append(i)
+        else:
+            rest.append(i)
+    if len(auto) <= 1:
+        return items
+    auto.sort(key=lambda x: float(x.get("fire_at", 0)))
+    return rest + [auto[0]]
+
 
 def _load_schedules() -> list[dict]:
     try:
-        return json.loads(_SCHEDULE_FILE.read_text())
+        raw = json.loads(_SCHEDULE_FILE.read_text())
     except Exception:
         return []
+    norm = _normalize_schedule_items(raw)
+    if len(norm) != len(raw):
+        _save_schedules(norm)
+    return norm
 
 
 def _save_schedules(items: list[dict]) -> None:
+    norm = _normalize_schedule_items(list(items))
     try:
-        _SCHEDULE_FILE.write_text(json.dumps(items, ensure_ascii=False))
+        _SCHEDULE_FILE.write_text(json.dumps(norm, ensure_ascii=False))
     except Exception:
         pass
 
@@ -116,10 +142,31 @@ async def _check_schedules() -> None:
             _activity(f"⏱ Шедуллер: {text}")
             if state.tg:
                 await state.tg.send_plain(text)
+            # Авто-ресет: одно срабатывание → запись уже не попадает в remaining (шедуллер очищен от неё)
         else:
             remaining.append(item)
     if len(remaining) != len(items):
         _save_schedules(remaining)
+
+
+def upsert_claude_auto_reset(fire_at: float) -> None:
+    """Одна запись claude_auto_reset; остальные расписания сохраняем."""
+    items = [i for i in _load_schedules() if i.get("kind") != SCHEDULE_KIND_CLAUDE_AUTO]
+    items.append(
+        {
+            "fire_at": fire_at,
+            "text": CLAUDE_RESET_REMINDER_TEXT,
+            "kind": SCHEDULE_KIND_CLAUDE_AUTO,
+        }
+    )
+    _save_schedules(items)
+
+
+def load_claude_auto_reset() -> dict | None:
+    for i in _load_schedules():
+        if i.get("kind") == SCHEDULE_KIND_CLAUDE_AUTO:
+            return i
+    return None
 
 
 # -------------------------------------------------------------------------- routes
@@ -131,36 +178,47 @@ async def health():
 
 @app.post("/local-approve")
 async def local_approve(request: Request):
-    """Approve or deny the most recent pending approve request from terminal."""
+    """Approve/deny tool from terminal, or unblock Stop hook (whip go)."""
     data = await request.json()
-    decision = data.get("decision", "approve")  # "approve" or "block"
+    flow = data.get("flow", "")
+    decision = data.get("decision", "approve")
     message = data.get("message", "")
 
-    # Find most recent pending approve
+    if flow == "stop_continue":
+        msg = (message or "ебаш дальше").strip() or "ебаш дальше"
+        for rid, pending in reversed(list(state.pending.items())):
+            if pending["type"] == "stop":
+                pending["response"] = {"action": "continue", "message": msg, "source": "terminal"}
+                msg_id = pending.get("message_id")
+                if msg_id and state.tg:
+                    orig = pending.get("original_text", "")
+                    asyncio.create_task(
+                        state.tg._edit_after_tap(msg_id, orig, f"Терминал: {msg[:120]}")
+                    )
+                pending["event"].set()
+                return JSONResponse({"ok": True, "rid": rid, "action": "continue"})
+        return JSONResponse({"ok": False, "error": "no pending stop"}, status_code=404)
+
     for rid, pending in reversed(list(state.pending.items())):
         if pending["type"] == "approve":
             if decision == "approve":
                 pending["response"] = {"decision": "approve", "source": "terminal"}
                 label = "✅ Одобрено с ноута"
             else:
-                pending["response"] = {"decision": "block", "reason": message or "Отклонено локально", "source": "terminal"}
+                pending["response"] = {
+                    "decision": "block",
+                    "reason": message or "Отклонено локально",
+                    "source": "terminal",
+                }
                 label = "❌ Отклонено с ноута"
 
-            # Edit TG message to show it was resolved locally
             msg_id = pending.get("message_id")
             if msg_id and state.tg:
-                original = f"(решено с ноута)"
-                asyncio.create_task(state.tg._edit_after_tap(msg_id, original, label))
+                orig = pending.get("original_text", "")
+                asyncio.create_task(state.tg._edit_after_tap(msg_id, orig, label))
 
             pending["event"].set()
             return JSONResponse({"ok": True, "rid": rid, "decision": decision})
-
-    # Also handle stop requests (continue from local)
-    for rid, pending in reversed(list(state.pending.items())):
-        if pending["type"] == "stop":
-            pending["response"] = {"action": "continue", "message": message or "продолжай", "source": "terminal"}
-            pending["event"].set()
-            return JSONResponse({"ok": True, "rid": rid, "action": "continue"})
 
     return JSONResponse({"ok": False, "error": "no pending requests"}, status_code=404)
 
@@ -188,9 +246,9 @@ async def stop(request: Request):
     project = _os.path.basename(cwd) if cwd else "unknown"
     short_summary = summary[:2000] if summary else "(нет текста)"
     text = (
-        f"📁 *{project}*\n"
+        f"📁 {project}\n"
         f"✅ Агент закончил\n\n"
-        f"```\n{short_summary}\n```"
+        f"{short_summary}\n"
     )
     buttons = [
         [{"text": "🚀 Ебаш дальше", "data": "continue"}],
@@ -200,11 +258,13 @@ async def stop(request: Request):
 
     _activity(f"✅ [{project}] Агент закончил")
     _activity(f"   {short_summary[:200].splitlines()[0] if short_summary else ''}")
-    _activity(f"   → whip go / whip go 'команда' / whip go s")
+    _activity(f"   → whip go  (или кнопка «Ебаш дальше» / /ebash в Telegram)")
 
     msg_id = await state.tg.send(text, buttons, rid)
     state.pending[rid]["message_id"] = msg_id
-    log.info("Stop hook [%s] waiting for Telegram...", rid)
+    state.pending[rid]["original_text"] = text
+    state.pending[rid]["project"] = project  # for multi-project /ebash:name routing
+    log.info("Stop hook [%s] [%s] waiting for Telegram...", rid, project)
 
     try:
         await asyncio.wait_for(event.wait(), timeout=CONFIG["timeout"])
@@ -247,7 +307,7 @@ async def approve(request: Request):
     import os as _os
     project = _os.path.basename(state.last_cwd) if state.last_cwd else "?"
     tool_text = _format_tool(tool_name, tool_input)
-    text = f"📁 *{project}*\n🔧 Разрешить?\n\n*{tool_name}*\n{tool_text}"
+    text = f"📁 {project}\n🔧 Разрешить?\n\n{tool_name}\n{tool_text}"
 
     preview = tool_input.get("command", "")[:80] if tool_name == "Bash" else str(tool_input)[:80]
     _activity(f"🔧 [{project}] {tool_name}: {preview}")
@@ -260,7 +320,9 @@ async def approve(request: Request):
         [{"text": "🔥 Да на всё в этой сессии", "data": "approve_all"}],
     ]
 
-    await state.tg.send(text, buttons, rid)
+    msg_id = await state.tg.send(text, buttons, rid)
+    state.pending[rid]["message_id"] = msg_id
+    state.pending[rid]["original_text"] = text
     log.info("Approve hook [%s] %s waiting...", rid, tool_name)
 
     try:
@@ -341,11 +403,11 @@ async def notify(request: Request):
 def _format_tool(tool_name: str, tool_input: dict) -> str:
     if tool_name == "Bash":
         cmd = tool_input.get("command", "")[:600]
-        return f"```\n$ {cmd}\n```"
+        return f"$ {cmd}"
     if tool_name in ("Write", "Edit", "Read"):
         path = tool_input.get("file_path", tool_input.get("path", ""))
-        return f"`{path}`"
+        return path or "(no path)"
     if tool_name == "Glob":
-        return f"`{tool_input.get('pattern', '')}`"
+        return tool_input.get("pattern", "") or "(no pattern)"
     import json
-    return f"```\n{json.dumps(tool_input, ensure_ascii=False)[:400]}\n```"
+    return json.dumps(tool_input, ensure_ascii=False)[:400]

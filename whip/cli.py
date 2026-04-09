@@ -211,12 +211,15 @@ def deny(reason):
 
 
 @cli.command()
-@click.argument("message", default="продолжай", required=False)
+@click.argument("message", default="ебаш дальше", required=False)
 def go(message):
     """Unblock a waiting Stop hook from terminal — agent continues."""
     try:
-        r = httpx.post(f"{_daemon_url()}/local-approve",
-                       json={"decision": "approve", "message": message}, timeout=5)
+        r = httpx.post(
+            f"{_daemon_url()}/local-approve",
+            json={"flow": "stop_continue", "message": message},
+            timeout=5,
+        )
         data = r.json()
         if data.get("ok"):
             click.echo(f"🚀 Sent [{data.get('rid')}]: {message}")
