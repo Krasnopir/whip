@@ -11,6 +11,8 @@ import httpx
 log = logging.getLogger("whip.tg")
 
 _TELEGRAM_TEXT_LIMIT = 4090
+_PLAYWRIGHT_SESSION = pathlib.Path.home() / ".whip" / "playwright_session.json"
+_playwright_lock = asyncio.Lock()
 
 
 def _truncate_tg(text: str) -> str:
@@ -209,6 +211,105 @@ async def fetch_claude_web_usage_block() -> str:
     return usage_snippets_from_html(html)
 
 
+# ------------------------------------------------------------------ Playwright
+
+async def fetch_claude_usage_playwright() -> tuple[str | None, str]:
+    """
+    Fetch claude.ai/settings/usage via Playwright using saved session.
+    Returns (page_inner_text, error_message). Bypasses Cloudflare.
+    """
+    try:
+        from playwright.async_api import async_playwright  # noqa: F401
+    except ImportError:
+        return None, (
+            "playwright не установлен.\n"
+            "uv add playwright && playwright install chromium"
+        )
+
+    if not _PLAYWRIGHT_SESSION.exists():
+        return None, (
+            "Нет сессии claude.ai.\n\n"
+            "Запусти в терминале:\n  whip claude-login\n"
+            "Залогинься в браузере, нажми Enter — сессия сохранится."
+        )
+
+    try:
+        storage_state = json.loads(_PLAYWRIGHT_SESSION.read_text())
+    except Exception:
+        return None, "Повреждён файл сессии. Запусти: whip claude-login"
+
+    async with _playwright_lock:
+        try:
+            from playwright.async_api import async_playwright
+            async with async_playwright() as p:
+                browser = await p.chromium.launch(headless=True)
+                ctx = await browser.new_context(storage_state=storage_state)
+                page = await ctx.new_page()
+
+                resp = await page.goto(
+                    "https://claude.ai/settings/usage",
+                    wait_until="domcontentloaded",
+                    timeout=30_000,
+                )
+                if resp and resp.status == 403:
+                    await browser.close()
+                    return None, (
+                        "Cloudflare отклонил (сессия устарела).\n"
+                        "Запусти: whip claude-login"
+                    )
+
+                # Wait for React/JS to render usage data
+                await page.wait_for_timeout(3_000)
+
+                text = await page.inner_text("body")
+
+                # Persist refreshed cookies for next call
+                new_state = await ctx.storage_state()
+                _PLAYWRIGHT_SESSION.write_text(json.dumps(new_state))
+
+                await browser.close()
+                return text, ""
+        except Exception as exc:
+            log.warning("Playwright fetch error: %s", exc)
+            return None, f"Playwright error: {exc}"
+
+
+def usage_snippets_from_text(text: str) -> str:
+    """Extract usage snippets from plain page text (Playwright inner_text)."""
+    snippets: list[str] = []
+    for pat in (
+        r"Current session[^\n]{0,160}",
+        r"Resets in[^\n]{5,160}",
+        r"\d{1,3}\s*%\s*used[^\n]{0,80}",
+    ):
+        for mm in re.finditer(pat, text, re.I):
+            frag = " ".join(mm.group(0).split())
+            if frag not in snippets:
+                snippets.append(frag[:240])
+
+    if not snippets:
+        return "\n\n🌐 claude.ai: не нашёл «Resets in» / «% used» на странице."
+
+    seen: set[str] = set()
+    uniq: list[str] = []
+    for s in snippets:
+        key = s[:100]
+        if key not in seen:
+            seen.add(key)
+            uniq.append(s)
+
+    return "\n\n🌐 claude.ai:\n" + "\n".join(f"• {s}" for s in uniq[:10])
+
+
+def scrape_reset_seconds_from_text(text: str) -> int | None:
+    """Parse 'Resets in ...' from plain page inner text."""
+    for mm in re.finditer(r"Resets in[^\n]{0,160}", text, re.I):
+        sec = parse_resets_in_seconds_from_blob(mm.group(0))
+        if sec is not None:
+            return sec
+    return None
+
+
 def _load_offset() -> int:
     try:
         return int(_OFFSET_FILE.read_text().strip())
@@ -405,6 +506,34 @@ class TelegramBridge:
             await self._handle_command(text, msg)
             return
 
+        # "reset 4h30m" shortcut — set/replace single claude auto-reset reminder
+        _reset_m = re.match(
+            r"^reset\s+((?:\d+h)?\s*(?:\d+m)?)\s*$", text, re.I
+        )
+        if _reset_m:
+            import re as _re, time as _t
+            from datetime import datetime, timedelta
+            from . import daemon as _d
+
+            dur_str = _reset_m.group(1).strip()
+            total = 0
+            for v, u in _re.findall(r"(\d+)([hm])", dur_str.lower()):
+                total += int(v) * (3600 if u == "h" else 60)
+
+            if total > 0:
+                fire_at = _t.time() + total
+                _d.upsert_claude_auto_reset(fire_at)
+                when = datetime.now() + timedelta(seconds=total)
+                h, rem = divmod(total, 3600)
+                m = rem // 60
+                await self.send_plain(
+                    f"✅ Напоминание о ресете обновлено: через {h}h {m}m\n"
+                    f"Срабатывает в {when.strftime('%H:%M')}"
+                )
+            else:
+                await self.send_plain("⚠️ Не понял время. Пример: reset 4h30m")
+            return
+
         # Find a pending request that's waiting for text input
         log.info("TG msg: %r | pending: %s", text[:60],
                  [(r, p["type"], p.get("awaiting_text")) for r, p in self.state.pending.items()])
@@ -497,6 +626,7 @@ class TelegramBridge:
 
         elif cmd == "/reset":
             from . import daemon as _d
+            from . import claude_desktop as _cd
             import time as _t
             from datetime import datetime, timedelta
 
@@ -507,45 +637,65 @@ class TelegramBridge:
                 m, s = divmod(rem, 60)
                 at = datetime.fromtimestamp(existing["fire_at"])
                 await self.send_plain(
-                    f"⏱ Уже стоит напоминание по лимитам (с claude.ai):\n"
+                    f"⏱ Уже стоит напоминание по лимитам:\n"
                     f"осталось {h}h {m}m {s}s → в {at.strftime('%d.%m %H:%M')}\n"
                     f"{existing.get('text', '')}"
                 )
                 return
 
-            html, err = await get_claude_usage_html()
-            if err:
-                await self.send_plain(f"⚠️ {err}")
-                return
-            sec = scrape_reset_seconds_from_usage_html(html or "")
-            if sec is None:
+            # Fetch from API via Claude Desktop cookies
+            try:
+                usage_data = await _cd.fetch_usage()
+                sec = _cd.next_reset_seconds(usage_data)
+            except Exception as e:
                 await self.send_plain(
-                    "⚠️ На странице не нашёл строку «Resets in …». "
-                    "Проверь /limits — там видно сырой текст; возможно сменилась вёрстка."
+                    f"⚠️ {e}\n\nИли введи вручную: reset 4h30m"
                 )
                 return
+
+            if sec is None:
+                await self.send_plain(
+                    "⚠️ Не нашёл время ресета в ответе API.\n"
+                    "Введи вручную: reset 4h30m"
+                )
+                return
+
             fire_at = _t.time() + sec
             _d.upsert_claude_auto_reset(fire_at)
             when = datetime.now() + timedelta(seconds=sec)
             h, r2 = divmod(sec, 3600)
             m, _ = divmod(r2, 60)
             await self.send_plain(
-                f"✅ Снял время с сайта: через {h}h {m}m ({sec // 60} мин).\n"
+                f"✅ Снял время с API: через {h}h {m}m.\n"
                 f"Напомню в {when.strftime('%H:%M')} — лимиты обновились."
             )
 
         elif cmd == "/limits":
             from . import daemon as _d
+            from . import claude_desktop as _cd
             import time as _t
 
-            api_text = await fetch_claude_web_usage_block()
+            # Fetch from claude.ai API via Claude Desktop cookies
+            try:
+                usage_data = await _cd.fetch_usage()
+                api_text = "\n\n" + _cd.format_usage(usage_data)
+
+                # Auto-update reset schedule if not set
+                sec = _cd.next_reset_seconds(usage_data)
+                if sec and not _d.load_claude_auto_reset():
+                    fire_at = _t.time() + sec
+                    _d.upsert_claude_auto_reset(fire_at)
+                    log.info("/limits auto-scheduled reset in %ds", sec)
+            except Exception as e:
+                api_text = f"\n\n⚠️ {e}"
+
             auto = _d.load_claude_auto_reset()
             if auto:
                 secs = max(0, int(auto["fire_at"] - _t.time()))
                 h, rem = divmod(secs, 3600)
                 m = rem // 60
-                reset_text = f"\n\n⏱ Напоминание о ресете лимитов: через {h}h{m}m"
+                reset_text = f"\n\n⏱ Напоминание о ресете: через {h}h{m}m"
             else:
-                reset_text = "\n\n⏱ Авто-напоминание не запланировано — /reset (берёт время с сайта)"
+                reset_text = "\n\n⏱ /reset — запланировать напоминание"
 
             await self.send_plain(f"📋 Лимиты{api_text}{reset_text}")

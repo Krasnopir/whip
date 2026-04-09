@@ -1,68 +1,63 @@
 # whip
 
-Управляй AI-агентами с телефона через Telegram. Лежишь на диване — агент спрашивает разрешения или закончил задачу — нажимаешь кнопку прямо в чате.
+Remote control for AI coding agents via Telegram. Your agent finishes a task or asks permission — you tap a button from your phone.
 
 ```
-Агент закончил → в Telegram:
+Agent done → Telegram:
 
-  ✅ Агент закончил
+  ✅ Agent finished
+  📁 myproject
 
-  Сделал рефактор auth модуля, вынес логику в сервис...
+  Refactored auth module, moved logic to service layer...
 
-  📁 /workspace/myproject
+  [🚀 Keep going]  [✏️ Send command]  [✅ Stop]
 
-  [🚀 Ебаш дальше]
-  [✏️ Написать команду]
-  [✅ Стоп, всё готово]
-
-Нажал "Ебаш дальше" → агент продолжает
-Написал текст → летит агенту как следующая команда
+Tap "Keep going" → agent continues
+Type text → sent to agent as next instruction
 ```
 
 ```
-Агент хочет выполнить rm -rf / → в Telegram:
+Agent wants to run rm -rf → Telegram:
 
-  🔧 Разрешить?
+  🔧 Allow?
   Bash
   $ rm -rf /tmp/old_build
 
-  [✅ Да]  [❌ Нет]
-  [🔥 Да на всё в этой сессии]
+  [✅ Yes]  [❌ No]
+  [🔥 Yes to everything this session]
 ```
 
-После нажатия кнопки — сообщение редактируется, кнопки скрываются, видно что выбрал.  
-В терминале показывает `[whip] ▶ продолжай`.
+After tapping — message edits itself, buttons disappear, your choice is visible.
+Terminal also shows `[whip] ▶ continuing`.
 
 ---
 
-## Быстрый старт
+## Quick start
 
-### 1. Создай Telegram бота
+### 1. Create a Telegram bot
 
-1. Напиши [@BotFather](https://t.me/BotFather) → `/newbot` → получи **токен**
-2. Напиши [@userinfobot](https://t.me/userinfobot) → получи свой **chat ID**
-3. Найди своего бота и напиши ему `/start`
+1. Message [@BotFather](https://t.me/BotFather) → `/newbot` → get **token**
+2. Message [@userinfobot](https://t.me/userinfobot) → get your **chat ID**
+3. Find your bot and send `/start`
 
-### 2. Установи whip
+### 2. Install whip
 
 ```bash
 git clone https://github.com/Krasnopir/whip.git
 cd whip
-python3 -m venv .venv
-source .venv/bin/activate   # Windows: .venv\Scripts\activate
-pip install -e .
+uv sync          # or: python3 -m venv .venv && source .venv/bin/activate && pip install -e .
 ```
 
-### 3. Настрой
+### 3. Configure
 
 ```bash
 whip setup
-# → введи токен бота
-# → введи chat ID
-# → автоматически пропишет хуки в Claude Code
+# → enter bot token
+# → enter chat ID
+# → automatically installs hooks into Claude Code
 ```
 
-Или вручную создай `~/.whip/.env`:
+Or create `~/.whip/.env` manually:
 
 ```env
 WHIP_TELEGRAM_TOKEN=1234567890:ABCdef...
@@ -71,93 +66,182 @@ WHIP_DAEMON_PORT=7331
 WHIP_TIMEOUT=1800
 ```
 
-### 4. Запусти демон
+### 4. Start the daemon
 
 ```bash
-whip start        # в отдельном терминале
-# или в фоне:
-whip start -d
+whip start        # foreground (separate terminal)
+whip start -d     # background
 ```
 
-Всё. Теперь запускай Claude Code в любом проекте — управление прилетает в телефон.
+Done. Launch Claude Code in any project — control arrives on your phone.
 
 ---
 
-## Как работает
+## How it works
 
 ```
 Claude Code
-   │ Stop hook (агент закончил)
-   │ PreToolUse hook (агент хочет запустить команду)
+   │ Stop hook       (agent finished a task)
+   │ PreToolUse hook (agent wants to run a command)
    ▼
-whip daemon (localhost:7331)   ← FastAPI, крутится локально
+whip daemon (localhost:7331)   ← FastAPI, runs locally
    │
-   ▼ Telegram Bot API (long-polling, без webhook)
-Твой телефон
+   ▼ Telegram Bot API (long-polling, no webhook needed)
+Your phone
 ```
 
-**Stop hook** — когда Claude Code заканчивает задачу, перехватывает момент и шлёт резюме в Telegram. Держит соединение открытым пока не нажмёшь кнопку (до 30 мин). Если нажал "Ебаш дальше" — агент получает команду и продолжает. Написал текст — летит как следующая инструкция.
+**Stop hook** — when Claude Code finishes, captures the moment and sends a summary to Telegram. Holds the connection open until you tap a button (up to 30 min). "Keep going" → agent gets a nudge and continues. Type text → flies to agent as the next instruction.
 
-**PreToolUse hook** — перехватывает потенциально опасные bash-команды (`rm`, `git push`, `git reset --hard`, `sudo`, и т.д.). "Да на всё" — включает режим автоапрува до конца сессии.
+**PreToolUse hook** — intercepts every tool call (or just dangerous bash — configurable). "Yes to everything" enables auto-approve mode for the rest of the session.
 
-**Никакого облака** — всё локально, Telegram только как транспорт.
+**No cloud** — everything is local, Telegram is just the transport.
 
 ---
 
-## Команды
+## Telegram commands
+
+| Command | Description |
+|---|---|
+| `/limits` | Current claude.ai usage: session %, weekly %, extra credits |
+| `/reset` | Schedule a reminder when the 5-hour session resets |
+| `/status` | Daemon status, active project, pending requests |
+| `/ebash` | Send a command to the most recently stopped agent |
+| `/ebash:projectname` | Route command to a specific project |
+| `/ebash:projectname text` | Send text immediately (no prompt) |
+
+**Plain text** while agent is stopped → sent as next instruction.  
+**`reset 4h30m`** (plain text, no slash) → set/update the reset reminder manually.
+
+---
+
+## CLI commands
 
 ```bash
-whip setup          # настройка + установка хуков в Claude Code
-whip start          # запустить демон (foreground)
-whip start -d       # запустить в фоне
-whip stop-daemon    # остановить фоновый демон
-whip status         # проверить что демон жив
-whip notify "текст" # отправить сообщение вручную (работает с любым агентом)
-whip notify "готово" -b "Продолжить" -b "Стоп"  # с кнопками
+whip setup          # configure + install Claude Code hooks
+whip start          # start daemon (foreground)
+whip start -d       # start in background
+whip stop-daemon    # stop background daemon
+whip status         # check daemon is alive
+whip approve        # approve pending tool from terminal (no phone needed)
+whip deny           # deny pending tool from terminal
+whip go             # unblock a waiting Stop hook from terminal
+whip go "text"      # unblock with a specific message
+whip tail           # watch all whip events in real time
+whip notify "text"  # send a Telegram message manually
+whip notify "done" -b "Continue" -b "Stop"   # with reply buttons
+whip reset-in 4h30m # schedule a Telegram notification after duration
 ```
 
 ---
 
-## Интеграция с Codex и другими агентами
+## Approvals from laptop + phone simultaneously
 
-Для любого агента без встроенных хуков используй `whip notify`:
+The terminal shows the approval prompt as soon as Claude Code triggers a hook:
 
-```bash
-# После завершения задачи
-codex "сделай тудулист" && whip notify "Codex закончил!" -b "Ебаш дальше" -b "Стоп"
+```
+[whip] 🔧 Bash: rm -rf /tmp/old_build
+[whip]    whip approve  /  whip deny   (or button in Telegram)
 ```
 
-Или в скрипте:
+First to respond wins — phone button or terminal command. The other channel sees the message updated.
+
+---
+
+## Multi-project support
+
+Run Claude Code in multiple projects simultaneously — whip tracks which is which.
+
+```
+/ebash            → routes to most recently stopped agent
+/ebash:frontend   → routes specifically to "frontend" project
+/ebash:backend "add tests" → sends text immediately to "backend"
+```
+
+If the project isn't active: `⚪ Project «frontend» is not active (active stops: backend)`.
+
+---
+
+## claude.ai usage data (macOS + Claude Desktop)
+
+On macOS with Claude Desktop installed, `/limits` reads live data directly from the claude.ai API using Claude Desktop's existing session — no setup needed.
+
+```
+📋 Limits
+
+⏱ Session (5h):   ████████ 95%  in 3h36m (at 23:00)
+📅 Weekly (7d):   ██░░░░░░ 27%  in 139h36m (at Mon 13:00)
+💳 Extra credits: ████████ 1709/1700 (100%)
+
+⏱ Reset reminder: in 3h36m
+```
+
+`/limits` also auto-schedules the reset reminder if none is set.  
+`/reset` fetches the reset time from the API and schedules/updates the reminder.
+
+---
+
+## PreToolUse modes
+
+Control which tools require Telegram approval via `WHIP_PRETOOL_MODE` in `~/.whip/.env`:
+
+| Mode | Behaviour |
+|---|---|
+| `all` (default) | Every tool call goes to Telegram |
+| `dangerous` | Only bash commands with `rm`, `git push`, `sudo`, etc. |
+| `safe_reads` | Skip Read/Glob/Grep/WebSearch — approve the rest |
+| `off` | No approvals (pass-through) |
+
+```env
+WHIP_PRETOOL_MODE=dangerous
+```
+
+---
+
+## Integration with Codex and other agents
+
+For agents without built-in hook support, use `whip notify`:
+
+```bash
+codex "build feature X" && whip notify "Codex done!" -b "Keep going" -b "Stop"
+```
 
 ```bash
 #!/bin/bash
 your-agent "$@"
-whip notify "Агент закончил задачу: $1" -b "Продолжить" -b "Стоп"
+whip notify "Agent finished: $1" -b "Continue" -b "Stop"
 ```
 
 ---
 
-## Автозапуск (macOS)
+## Auto-start on macOS
 
-Чтобы демон стартовал сам при входе в систему, добавь в `~/.zshrc`:
+Add to `~/.zshrc` or a launchd plist:
 
 ```bash
-pgrep -f "uvicorn whip.daemon" > /dev/null || \
-  nohup /path/to/whip/.venv/bin/python \
-  -m uvicorn whip.daemon:app --host 127.0.0.1 --port 7331 \
-  >> ~/.whip/daemon.log 2>&1 &
+pgrep -f "whip start" > /dev/null || whip start -d
 ```
 
 ---
 
-## Конфиг
+## Config reference
 
-| Переменная | По умолчанию | Описание |
+| Variable | Default | Description |
 |---|---|---|
-| `WHIP_TELEGRAM_TOKEN` | — | Токен бота от BotFather |
-| `WHIP_TELEGRAM_CHAT_ID` | — | Твой chat ID |
-| `WHIP_DAEMON_PORT` | `7331` | Порт демона |
-| `WHIP_TIMEOUT` | `1800` | Таймаут ожидания ответа (сек) |
+| `WHIP_TELEGRAM_TOKEN` | — | Bot token from BotFather |
+| `WHIP_TELEGRAM_CHAT_ID` | — | Your Telegram chat ID |
+| `WHIP_DAEMON_PORT` | `7331` | Daemon port |
+| `WHIP_TIMEOUT` | `1800` | Max wait for user response (seconds) |
+| `WHIP_PRETOOL_MODE` | `all` | Approval mode: `all`, `dangerous`, `safe_reads`, `off` |
+| `WHIP_DAEMON_HOST` | `127.0.0.1` | Daemon bind host |
+
+---
+
+## Requirements
+
+- Python 3.10+
+- Claude Code (for Stop and PreToolUse hooks)
+- A Telegram bot token + your chat ID
+- macOS (for claude.ai usage data via Claude Desktop) — optional
 
 ---
 

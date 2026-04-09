@@ -330,6 +330,83 @@ def reset_in(duration, message):
         click.echo(f"Daemon unreachable: {e}", err=True)
 
 
+# ------------------------------------------------------------------ claude-login
+
+@cli.command("claude-login")
+def claude_login():
+    """
+    Open a browser window to log in to claude.ai and save the session.
+
+    Run once so /limits and /reset can read your usage data.
+    Re-run if Cloudflare starts blocking again.
+    """
+    import asyncio
+
+    async def _run():
+        try:
+            from playwright.async_api import async_playwright
+        except ImportError:
+            click.echo("playwright not installed. Run: uv add playwright && playwright install chromium")
+            return
+
+        session_file = Path.home() / ".whip" / "playwright_session.json"
+
+        storage_state = None
+        if session_file.exists():
+            try:
+                storage_state = json.loads(session_file.read_text())
+                click.echo("Found existing session, loading it...")
+            except Exception:
+                pass
+
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=False)
+            ctx_kwargs: dict = {}
+            if storage_state:
+                ctx_kwargs["storage_state"] = storage_state
+
+            ctx = await browser.new_context(**ctx_kwargs)
+            page = await ctx.new_page()
+
+            click.echo("\nOpening claude.ai in browser...")
+            await page.goto("https://claude.ai", timeout=60_000)
+
+            click.echo("Waiting for you to log in... (browser will close automatically)")
+
+            # Auto-detect login: wait until URL is no longer on auth/login pages
+            # and the main app has loaded (up to 3 minutes)
+            try:
+                await page.wait_for_url(
+                    lambda url: (
+                        "claude.ai" in url
+                        and "/login" not in url
+                        and "/auth" not in url
+                        and "sign" not in url.lower()
+                    ),
+                    timeout=180_000,
+                )
+                # Give the page a moment to settle and set all cookies
+                await page.wait_for_timeout(2_000)
+            except Exception:
+                click.echo("Timed out waiting for login. Try again.")
+                await browser.close()
+                return
+
+            state = await ctx.storage_state()
+            session_file.parent.mkdir(parents=True, exist_ok=True)
+            session_file.write_text(json.dumps(state))
+            await browser.close()
+
+        click.echo(f"\n✅ Session saved → {session_file}")
+        click.echo("Now use /limits and /reset in Telegram.")
+
+    try:
+        asyncio.run(_run())
+    except Exception as e:
+        click.echo(f"Error: {e}", err=True)
+        sys.exit(1)
+
+
 # ------------------------------------------------------------------ notify
 
 @cli.command()
