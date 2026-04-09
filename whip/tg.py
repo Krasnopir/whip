@@ -236,8 +236,8 @@ class TelegramBridge:
 
     # ------------------------------------------------------------------ send
 
-    async def send(self, text: str, buttons: list[list[dict]], request_id: str) -> int | None:
-        """Send message with inline keyboard. Returns message_id for later editing."""
+    async def send(self, text: str, buttons: list[list[dict]], request_id: str) -> int:
+        """Send message with inline keyboard. Returns message_id. Raises on failure."""
         text = _truncate_tg(text)
         keyboard = {
             "inline_keyboard": [
@@ -246,7 +246,6 @@ class TelegramBridge:
             ]
         }
         async with httpx.AsyncClient() as client:
-            # Plain text only — Markdown breaks on arbitrary code/paths and drops the message.
             r = await client.post(
                 f"{self.base}/sendMessage",
                 json={
@@ -259,8 +258,7 @@ class TelegramBridge:
             data = r.json()
             if data.get("ok"):
                 return data["result"]["message_id"]
-            log.warning("TG sendMessage failed: %s", r.text)
-            return None
+            raise RuntimeError(f"TG sendMessage failed: {r.text[:200]}")
 
     async def _edit_after_tap(self, message_id: int, original_text: str, chosen_label: str) -> None:
         """Replace buttons with a single line showing what was tapped."""

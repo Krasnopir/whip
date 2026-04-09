@@ -260,12 +260,29 @@ async def stop(request: Request):
     _activity(f"   {short_summary[:200].splitlines()[0] if short_summary else ''}")
     _activity(f"   → whip go  (или кнопка «Ебаш дальше» / /ebash в Telegram)")
 
-    msg_id = await state.tg.send(text, buttons, rid)
+    try:
+        msg_id = await state.tg.send(text, buttons, rid)
+    except Exception as e:
+        # TG unreachable — don't hang the agent; auto-stop immediately
+        log.warning("Stop hook [%s] TG send failed (%s) — auto-stop", rid, e)
+        state.pop(rid)
+        _activity(f"   ⚠️ TG недоступен — агент остановлен автоматически")
+        return JSONResponse({"action": "done", "message": ""})
+
+    if msg_id is None:
+        # TG returned ok=False — same fallback
+        log.warning("Stop hook [%s] TG send returned None — auto-stop", rid)
+        state.pop(rid)
+        _activity(f"   ⚠️ TG не ответил — агент остановлен автоматически")
+        return JSONResponse({"action": "done", "message": ""})
+
     state.pending[rid]["message_id"] = msg_id
     state.pending[rid]["original_text"] = text
     state.pending[rid]["project"] = project  # for multi-project /ebash:name routing
     log.info("Stop hook [%s] [%s] waiting for Telegram...", rid, project)
 
+    # Wait up to CONFIG["timeout"] for user response.
+    # If no response, auto-stop (don't block the agent forever).
     try:
         await asyncio.wait_for(event.wait(), timeout=CONFIG["timeout"])
     except asyncio.TimeoutError:
@@ -320,7 +337,19 @@ async def approve(request: Request):
         [{"text": "🔥 Да на всё в этой сессии", "data": "approve_all"}],
     ]
 
-    msg_id = await state.tg.send(text, buttons, rid)
+    try:
+        msg_id = await state.tg.send(text, buttons, rid)
+    except Exception as e:
+        # TG unreachable — auto-approve so agent isn't blocked
+        log.warning("Approve hook [%s] TG send failed (%s) — auto-approve", rid, e)
+        state.pop(rid)
+        return JSONResponse({"decision": "approve"})
+
+    if msg_id is None:
+        log.warning("Approve hook [%s] TG send returned None — auto-approve", rid)
+        state.pop(rid)
+        return JSONResponse({"decision": "approve"})
+
     state.pending[rid]["message_id"] = msg_id
     state.pending[rid]["original_text"] = text
     log.info("Approve hook [%s] %s waiting...", rid, tool_name)
