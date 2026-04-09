@@ -84,13 +84,19 @@ def main():
     else:
         preview = str(tool_input)[:100]
 
-    # Print to terminal — user can approve from another tab
-    sys.stderr.write(
+    # Write directly to /dev/tty so it's visible in the terminal
+    # regardless of Claude Code's TUI capturing stderr.
+    _notice = (
         f"\n[whip] 🔧 {tool_name}: {preview}\n"
-        f"[whip]    → другой таб: whip approve  /  whip deny\n"
-        f"[whip]    → или нажми кнопку в Telegram\n"
+        f"[whip]    whip approve  /  whip deny   (или кнопка в Telegram)\n"
     )
-    sys.stderr.flush()
+    try:
+        with open("/dev/tty", "w") as _tty:
+            _tty.write(_notice)
+            _tty.flush()
+    except Exception:
+        sys.stderr.write(_notice)
+        sys.stderr.flush()
 
     try:
         import httpx
